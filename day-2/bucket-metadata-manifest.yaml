@@ -1,0 +1,26 @@
+bucket_name: savitha-labs-boto3-day2
+region: us-east-1
+environment: learning
+
+purpose: 
+  Learn to do s3 bucket management through python- boto3
+
+owner:
+  name: Savitha
+  role: Intern
+  contact_email: savitha@example.com
+
+data:
+  classification: training
+  contains_pii: false
+  encryption: sse-s3
+
+access:
+  programmatic_access: true
+  tools_used:
+    - boto3
+    - python
+
+created_by:
+  method: boto3
+  date: 2025-01
