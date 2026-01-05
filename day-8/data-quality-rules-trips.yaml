@@ -1,0 +1,107 @@
+# Data Quality Rules for Enriched Trip Data (Simplified)
+# Day 8: Data Quality Checks
+#
+# This file defines 6 essential quality checks for the silver enriched trip data.
+# The checks cover:
+#   - Completeness: Required timestamp fields
+#   - Business Rules: Fare and duration validation
+#   - Referential Integrity: Zone enrichment validation (NULL = orphan record)
+#
+# Input: s3://day-6-datalake-nyc-data/silver/trips_enriched/ (from Day 7)
+
+expectation_suite_name: trips_quality_simple
+
+meta:
+  owner: Data Engineering
+  description: Simplified quality rules for enriched trip data
+  source_table: silver_trips_enriched
+  last_updated: "2026-01-05"
+
+expectations:
+  # ============================================
+  # COMPLETENESS CHECKS
+  # ============================================
+  
+  # Check 1: Pickup timestamp must exist
+  - expectation_type: expect_column_values_to_not_be_null
+    kwargs:
+      column: tpep_pickup_datetime
+    meta:
+      dimension: completeness
+      severity: critical
+      business_rule: Every trip must have a pickup timestamp
+      business_impact: Cannot calculate trip duration or time-based analytics
+
+  # Check 2: Dropoff timestamp must exist
+  - expectation_type: expect_column_values_to_not_be_null
+    kwargs:
+      column: tpep_dropoff_datetime
+    meta:
+      dimension: completeness
+      severity: critical
+      business_rule: Every trip must have a dropoff timestamp
+      business_impact: Cannot calculate trip duration
+
+  # ============================================
+  # BUSINESS RULE CHECKS
+  # ============================================
+  
+  # Check 3: Fare amount must be reasonable
+  - expectation_type: expect_column_values_to_be_between
+    kwargs:
+      column: fare_amount
+      min_value: 0
+      max_value: 500
+    meta:
+      dimension: business_rule
+      severity: high
+      business_rule: Fare must be between $0 and $500
+      business_impact: Affects revenue reporting accuracy
+
+  # Check 4: Trip duration must be reasonable
+  - expectation_type: expect_column_values_to_be_between
+    kwargs:
+      column: trip_duration_minutes
+      min_value: 0
+      max_value: 180
+    meta:
+      dimension: business_rule
+      severity: high
+      business_rule: Trip duration must be between 0 and 180 minutes
+      business_impact: Identifies timestamp errors or data quality issues
+
+  # ============================================
+  # REFERENTIAL INTEGRITY CHECKS
+  # ============================================
+  
+  # Check 5: Pickup zone must be enriched (not NULL = valid zone reference)
+  # NULL values indicate orphan records where PULocationID didn't match any zone
+  - expectation_type: expect_column_values_to_not_be_null
+    kwargs:
+      column: pickup_zone_name
+    meta:
+      dimension: referential_integrity
+      severity: high
+      business_rule: Pickup location must match a valid zone
+      business_impact: Cannot analyze trip patterns by zone
+
+  # Check 6: Dropoff zone must be enriched (not NULL = valid zone reference)
+  # NULL values indicate orphan records where DOLocationID didn't match any zone
+  - expectation_type: expect_column_values_to_not_be_null
+    kwargs:
+      column: dropoff_zone_name
+    meta:
+      dimension: referential_integrity
+      severity: high
+      business_rule: Dropoff location must match a valid zone
+      business_impact: Cannot analyze trip patterns by zone
+
+# ============================================
+# QUALITY THRESHOLDS
+# ============================================
+quality_thresholds:
+  overall_pass_threshold: 95.0
+  dimension_thresholds:
+    completeness: 99.0
+    business_rule: 95.0
+    referential_integrity: 99.0
