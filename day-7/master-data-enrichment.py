@@ -15,54 +15,27 @@ Important: Day 7 focuses on TRANSFORMATIONS ONLY - no validation flags.
 Unmatched zones will have NULL values. Day 8 will analyze these for
 referential integrity reporting.
 
-Input: s3://day-6-datalake-nyc-data/silver/trips_cleaned/ (Delta)
-Input: s3://day-6-datalake-nyc-data/gold/taxi_zones_master/ (Delta)
-Output: s3://day-6-datalake-nyc-data/silver/trips_enriched/ (Delta)
+Input: s3a://day-7-spark-glue/silver/trips_cleaned/ (Delta)
+Input: s3a://day-7-spark-glue/gold/taxi_zones_master/ (Delta)
+Output: s3a://day-7-spark-glue/silver/trips_enriched/ (Delta)
 """
 
 import sys
 
-from delta import configure_spark_with_delta_pip
-from pyspark.sql import SparkSession
 from pyspark.sql.functions import (
     broadcast,
     col,
     current_timestamp,
 )
+from spark_session import create_spark_session
 
 # ============================================
 # CONFIGURATION
 # ============================================
-S3_BUCKET = "day-6-datalake-nyc-data"
-SILVER_TRIPS_PATH = f"s3://{S3_BUCKET}/silver/trips_cleaned/"
-GOLD_ZONES_MASTER_PATH = f"s3://{S3_BUCKET}/gold/taxi_zones_master/"
-SILVER_ENRICHED_PATH = f"s3://{S3_BUCKET}/silver/trips_enriched/"
-
-
-# ============================================
-# INITIALIZE SPARK SESSION
-# ============================================
-def create_spark_session():
-    """Create and configure Spark session for S3 access with Delta Lake support."""
-    builder = (
-        SparkSession.builder.appName("MasterDataEnrichment")
-        .config("spark.sql.adaptive.enabled", "true")
-        .config("spark.sql.adaptive.coalescePartitions.enabled", "true")
-        .config("spark.sql.autoBroadcastJoinThreshold", "10485760")  # 10MB threshold
-        .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
-        .config(
-            "spark.sql.catalog.spark_catalog",
-            "org.apache.spark.sql.delta.catalog.DeltaCatalog",
-        )
-    )
-
-    # Configure Spark with Delta Lake
-    spark = configure_spark_with_delta_pip(builder).getOrCreate()
-
-    # Set log level to reduce noise
-    spark.sparkContext.setLogLevel("WARN")
-
-    return spark
+S3_BUCKET = "day-7-spark-glue"
+SILVER_TRIPS_PATH = f"s3a://{S3_BUCKET}/silver/trips_cleaned/"
+GOLD_ZONES_MASTER_PATH = f"s3a://{S3_BUCKET}/gold/taxi_zones_master/"
+SILVER_ENRICHED_PATH = f"s3a://{S3_BUCKET}/silver/trips_enriched/"
 
 
 def read_silver_trips(spark, path):
@@ -252,8 +225,8 @@ def main():
     print("(Trip Data with Zone Information)")
     print("=" * 60)
 
-    # Initialize Spark
-    spark = create_spark_session()
+    # Initialize Spark session
+    spark = create_spark_session("MasterDataEnrichment")
 
     try:
         # Step 1: Read cleaned trips from silver zone (Task 7.1a output)

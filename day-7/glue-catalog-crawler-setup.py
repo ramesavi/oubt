@@ -24,7 +24,7 @@ Prerequisites:
 
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
 import boto3
 from botocore.exceptions import ClientError
@@ -32,9 +32,10 @@ from botocore.exceptions import ClientError
 # ============================================
 # CONFIGURATION
 # ============================================
-S3_BUCKET = "day-6-datalake-nyc-data"
+S3_BUCKET = "day-7-spark-glue"
 DATABASE_NAME = "nyc_taxi_db"
 GLUE_ROLE = "GlueServiceRole"  # IAM role for Glue
+AWS_REGION = "us-east-1"  # Default AWS region
 
 # Crawler configurations
 CRAWLERS = [
@@ -182,7 +183,95 @@ TABLE_METADATA = {
 # ============================================
 def create_glue_client():
     """Create and return a boto3 Glue client."""
-    return boto3.client("glue")
+    return boto3.client("glue", region_name=AWS_REGION)
+
+
+def create_iam_client():
+    """Create and return a boto3 IAM client."""
+    return boto3.client("iam", region_name=AWS_REGION)
+
+
+# ============================================
+# IAM ROLE CREATION
+# ============================================
+def create_glue_service_role(iam_client):
+    """
+    Create the IAM role required for AWS Glue crawlers.
+
+    This role allows Glue to:
+    - Access S3 buckets for crawling data
+    - Write to CloudWatch Logs
+    - Perform Glue operations
+
+    Returns:
+        bool: True if role was created or already exists, False on error
+    """
+    print("\n" + "=" * 60)
+    print("Creating IAM Role for Glue Service")
+    print("=" * 60)
+
+    # Trust policy allowing Glue to assume this role
+    trust_policy = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Principal": {"Service": "glue.amazonaws.com"},
+                "Action": "sts:AssumeRole",
+            }
+        ],
+    }
+
+    try:
+        # Check if role already exists
+        try:
+            iam_client.get_role(RoleName=GLUE_ROLE)
+            print(f"  IAM Role '{GLUE_ROLE}' already exists")
+            return True
+        except ClientError as e:
+            if e.response["Error"]["Code"] != "NoSuchEntity":
+                raise
+
+        # Create the role
+        print(f"  Creating IAM role: {GLUE_ROLE}")
+        iam_client.create_role(
+            RoleName=GLUE_ROLE,
+            AssumeRolePolicyDocument=str(trust_policy).replace("'", '"'),
+            Description="IAM role for AWS Glue crawlers to access S3 and Glue resources",
+            Tags=[
+                {"Key": "Project", "Value": "MDM Training"},
+                {"Key": "CreatedBy", "Value": "glue-catalog-crawler-setup.py"},
+            ],
+        )
+        print(f"  Role created: {GLUE_ROLE}")
+
+        # Attach AWS managed policies
+        policies_to_attach = [
+            {
+                "arn": "arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole",
+                "name": "AWSGlueServiceRole",
+            },
+            {
+                "arn": "arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess",
+                "name": "AmazonS3ReadOnlyAccess",
+            },
+        ]
+
+        for policy in policies_to_attach:
+            print(f"  Attaching policy: {policy['name']}")
+            iam_client.attach_role_policy(
+                RoleName=GLUE_ROLE,
+                PolicyArn=policy["arn"],
+            )
+
+        print(f"\n  IAM Role '{GLUE_ROLE}' created successfully!")
+        print("  Waiting 10 seconds for IAM role propagation...")
+        time.sleep(10)  # IAM roles need time to propagate
+        return True
+
+    except ClientError as e:
+        print(f"  Error creating IAM role: {e}")
+        return False
 
 
 # ============================================
@@ -207,7 +296,7 @@ def create_database(glue_client):
                 "LocationUri": f"s3://{S3_BUCKET}/",
                 "Parameters": {
                     "created_by": "glue-catalog-crawler-setup.py",
-                    "created_at": datetime.utcnow().isoformat(),
+                    "created_at": datetime.now(timezone.utc).isoformat(),
                     "project": "MDM Training",
                     "data_domain": "Transportation",
                 },
@@ -251,6 +340,33 @@ def create_crawlers(glue_client):
 
     created_crawlers = []
 
+    # Verify the IAM role exists (should have been created in Step 0)
+    iam_client = boto3.client("iam", region_name=AWS_REGION)
+    try:
+        iam_client.get_role(RoleName=GLUE_ROLE)
+        print(f"  IAM Role '{GLUE_ROLE}' verified")
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "NoSuchEntity":
+            print(f"\n  ERROR: IAM Role '{GLUE_ROLE}' does not exist!")
+            print(
+                "  This should have been created in Step 0. Please check for errors above."
+            )
+            return created_crawlers
+        else:
+            print(f"  Error checking IAM role: {e}")
+            raise
+
+    # Delta Lake crawler configuration
+    # This tells Glue to recognize Delta Lake table format
+    delta_config = {
+        "Version": 1.0,
+        "CrawlerOutput": {
+            "Partitions": {"AddOrUpdateBehavior": "InheritFromTable"},
+            "Tables": {"AddOrUpdateBehavior": "MergeNewColumns"},
+        },
+        "Grouping": {"TableGroupingPolicy": "CombineCompatibleSchemas"},
+    }
+
     for crawler in CRAWLERS:
         try:
             glue_client.create_crawler(
@@ -258,14 +374,21 @@ def create_crawlers(glue_client):
                 Role=GLUE_ROLE,
                 DatabaseName=DATABASE_NAME,
                 Description=crawler["description"],
-                Targets={"S3Targets": [{"Path": crawler["path"]}]},
+                Targets={
+                    "DeltaTargets": [
+                        {
+                            "DeltaTables": [crawler["path"]],
+                            "WriteManifest": True,
+                        }
+                    ]
+                },
                 TablePrefix=crawler["prefix"],
                 SchemaChangePolicy={
                     "UpdateBehavior": "UPDATE_IN_DATABASE",
                     "DeleteBehavior": "LOG",
                 },
                 Schedule=crawler["schedule"],
-                Configuration='{"Version":1.0,"CrawlerOutput":{"Partitions":{"AddOrUpdateBehavior":"InheritFromTable"}}}',
+                Configuration=str(delta_config).replace("'", '"'),
             )
             print(f"  - {crawler['name']} → {crawler['path']}")
             print(f"    Prefix: {crawler['prefix']}")
@@ -274,9 +397,104 @@ def create_crawlers(glue_client):
 
         except ClientError as e:
             if e.response["Error"]["Code"] == "AlreadyExistsException":
-                print(f"  - {crawler['name']} → {crawler['path']}")
-                print("    Status: Already exists (skipping creation)")
+                # Check if the crawler needs to be updated with new S3 path
+                existing_crawler = glue_client.get_crawler(Name=crawler["name"])
+                existing_targets = existing_crawler["Crawler"].get("Targets", {})
+                existing_s3_targets = existing_targets.get("S3Targets", [])
+                existing_path = (
+                    existing_s3_targets[0]["Path"] if existing_s3_targets else ""
+                )
+
+                # Check if using Delta targets or needs update
+                existing_delta_targets = existing_targets.get("DeltaTargets", [])
+                existing_delta_path = (
+                    existing_delta_targets[0]["DeltaTables"][0]
+                    if existing_delta_targets
+                    and existing_delta_targets[0].get("DeltaTables")
+                    else ""
+                )
+
+                needs_update = (
+                    existing_path != crawler["path"]
+                    and existing_delta_path != crawler["path"]
+                ) or not existing_delta_targets
+
+                if needs_update:
+                    print(f"  - {crawler['name']}: Updating to Delta Lake format")
+                    print(f"    Old path: {existing_path or existing_delta_path}")
+                    print(f"    New path: {crawler['path']}")
+
+                    # Check if crawler is running and stop it
+                    crawler_state = existing_crawler["Crawler"]["State"]
+                    if crawler_state in ["RUNNING", "STOPPING"]:
+                        print(f"    Stopping crawler (current state: {crawler_state})...")
+                        try:
+                            glue_client.stop_crawler(Name=crawler["name"])
+                        except ClientError:
+                            pass  # May already be stopping
+
+                        # Wait for crawler to stop
+                        max_wait = 60  # seconds
+                        waited = 0
+                        while waited < max_wait:
+                            time.sleep(5)
+                            waited += 5
+                            check_response = glue_client.get_crawler(Name=crawler["name"])
+                            current_state = check_response["Crawler"]["State"]
+                            if current_state == "READY":
+                                print(f"    Crawler stopped")
+                                break
+                            print(f"    Waiting for crawler to stop ({current_state})...")
+
+                    # Update the crawler with Delta targets
+                    glue_client.update_crawler(
+                        Name=crawler["name"],
+                        Role=GLUE_ROLE,
+                        DatabaseName=DATABASE_NAME,
+                        Description=crawler["description"],
+                        Targets={
+                            "DeltaTargets": [
+                                {
+                                    "DeltaTables": [crawler["path"]],
+                                    "WriteManifest": True,
+                                }
+                            ]
+                        },
+                        TablePrefix=crawler["prefix"],
+                        SchemaChangePolicy={
+                            "UpdateBehavior": "UPDATE_IN_DATABASE",
+                            "DeleteBehavior": "LOG",
+                        },
+                        Schedule=crawler["schedule"],
+                        Configuration=str(delta_config).replace("'", '"'),
+                    )
+                    print("    Status: Updated to Delta Lake format")
+                else:
+                    print(f"  - {crawler['name']} → {crawler['path']}")
+                    print("    Status: Already exists (Delta Lake format)")
                 created_crawlers.append(crawler["name"])
+            elif e.response["Error"]["Code"] == "InvalidInputException":
+                error_msg = str(e)
+                if "TrustPolicy" in error_msg or "assume" in error_msg.lower():
+                    print(f"  - {crawler['name']}: IAM role trust policy issue")
+                    print(
+                        f"    The role '{GLUE_ROLE}' needs a trust policy allowing glue.amazonaws.com"
+                    )
+                    print("    Run this command to fix:")
+                    print(f"""
+    aws iam update-assume-role-policy --role-name {GLUE_ROLE} \\
+      --policy-document '{{
+        "Version": "2012-10-17",
+        "Statement": [{{
+          "Effect": "Allow",
+          "Principal": {{"Service": "glue.amazonaws.com"}},
+          "Action": "sts:AssumeRole"
+        }}]
+      }}'
+""")
+                else:
+                    print(f"  Error creating crawler {crawler['name']}: {e}")
+                    raise
             else:
                 print(f"  Error creating crawler {crawler['name']}: {e}")
                 raise
@@ -427,7 +645,7 @@ def add_governance_lineage_metadata(glue_client):
             table = response["Table"]
 
             # Update lineage_updated timestamp
-            properties["lineage_updated"] = datetime.utcnow().isoformat()
+            properties["lineage_updated"] = datetime.now(timezone.utc).isoformat()
 
             # Merge with existing parameters
             current_params = table.get("Parameters", {})
@@ -573,40 +791,117 @@ def main():
     print("Day 7 Task 7.5: AWS Glue Catalog & Crawler Setup with Lineage")
     print("=" * 60)
 
-    # Initialize Glue client
+    # Initialize clients
     glue_client = create_glue_client()
+    iam_client = create_iam_client()
+
+    # Track setup status
+    setup_status = {
+        "iam_role_created": False,
+        "database_created": False,
+        "crawlers_created": [],
+        "crawlers_started": [],
+        "tables_updated": [],
+        "tables_not_found": [],
+    }
 
     try:
+        # Step 0: Create IAM role for Glue (if it doesn't exist)
+        setup_status["iam_role_created"] = create_glue_service_role(iam_client)
+
+        if not setup_status["iam_role_created"]:
+            print("\n  Cannot proceed without IAM role. Exiting.")
+            sys.exit(1)
+
         # Step 1: Create database
-        create_database(glue_client)
+        setup_status["database_created"] = create_database(glue_client)
 
         # Step 2: Create crawlers for each zone
         crawler_names = create_crawlers(glue_client)
+        setup_status["crawlers_created"] = crawler_names
 
         # Step 3: Run crawlers (initial run)
         # Note: In production, you might want to set wait_for_completion=True
         # For demo purposes, we'll start them and continue
-        run_crawlers(glue_client, crawler_names, wait_for_completion=False)
+        if crawler_names:
+            started = run_crawlers(
+                glue_client, crawler_names, wait_for_completion=False
+            )
+            setup_status["crawlers_started"] = started
 
-        # Step 4: Add governance + lineage metadata
-        # Note: This may fail for some tables if crawlers haven't completed
-        print("\n  Note: Waiting 10 seconds for crawlers to create initial tables...")
-        time.sleep(10)
-        add_governance_lineage_metadata(glue_client)
+            # Step 4: Add governance + lineage metadata
+            # Note: This may fail for some tables if crawlers haven't completed
+            print(
+                "\n  Note: Waiting 10 seconds for crawlers to create initial tables..."
+            )
+            time.sleep(10)
+            updated, not_found = add_governance_lineage_metadata(glue_client)
+            setup_status["tables_updated"] = updated
+            setup_status["tables_not_found"] = not_found
 
-        # Step 5: Verify crawler schedules
-        verify_crawler_schedules(glue_client)
+            # Step 5: Verify crawler schedules
+            verify_crawler_schedules(glue_client)
+        else:
+            print("\n  Skipping Steps 3-5 (no crawlers created)")
 
-        # Print final summary
-        print_summary()
-
-        print("\nSetup completed successfully!")
-        print("\nNote: If some tables were not found, run this script again")
-        print("after crawlers have completed to add metadata to all tables.")
+        # Print final summary based on actual status
+        print_dynamic_summary(setup_status)
 
     except Exception as e:
         print(f"\nError during setup: {e}")
         sys.exit(1)
+
+
+def print_dynamic_summary(status):
+    """Print summary based on actual setup status."""
+    print("\n" + "=" * 60)
+    print("=== SETUP SUMMARY ===")
+    print("=" * 60)
+
+    # IAM Role status
+    iam_status = "Created/Exists" if status.get("iam_role_created") else "Failed"
+    print("\nStep 0: IAM Role Creation")
+    print(f"  Role: {GLUE_ROLE}")
+    print(f"  Status: {iam_status}")
+
+    # Database status
+    db_status = "Created/Exists" if status["database_created"] else "Failed"
+    print("\nStep 1: Database Creation")
+    print(f"  Database: {DATABASE_NAME}")
+    print(f"  Status: {db_status}")
+
+    # Crawler status
+    print("\nStep 2: Crawler Creation")
+    if status["crawlers_created"]:
+        for crawler in status["crawlers_created"]:
+            print(f"  - {crawler}: Created/Exists")
+    else:
+        print("  No crawlers created (IAM role issue - see instructions above)")
+
+    # Crawler run status
+    print("\nStep 3: Crawler Execution")
+    if status["crawlers_started"]:
+        for crawler in status["crawlers_started"]:
+            print(f"  - {crawler}: Started")
+    else:
+        print("  No crawlers started")
+
+    # Metadata status
+    print("\nStep 4: Governance + Lineage Metadata")
+    print(f"  Tables updated: {len(status['tables_updated'])}")
+    print(f"  Tables not found: {len(status['tables_not_found'])}")
+
+    # Overall status
+    print("\n" + "-" * 60)
+    if status["crawlers_created"]:
+        print("Setup completed successfully!")
+        if status["tables_not_found"]:
+            print("\nNote: Some tables were not found. Run this script again")
+            print("after crawlers have completed to add metadata to all tables.")
+    else:
+        print("Setup partially completed.")
+        print("\nAction Required: Create the IAM role using the commands above,")
+        print("then run this script again to complete the setup.")
 
 
 if __name__ == "__main__":

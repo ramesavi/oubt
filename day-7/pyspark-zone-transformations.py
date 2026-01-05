@@ -12,14 +12,13 @@ Transformation Categories:
 Important: Day 7 focuses on TRANSFORMATIONS ONLY - no validation or quality checks.
 All quality checks happen in Day 8.
 
-Input: s3://day-6-datalake-nyc-data/bronze/taxi_zones/ (CSV format)
-Silver Output: s3://day-6-datalake-nyc-data/silver/zones_cleaned/ (Delta format)
-Gold Output: s3://day-6-datalake-nyc-data/gold/taxi_zones_master/ (Delta format)
+Input: s3a://day-7-spark-glue/bronze/taxi_zones/ (CSV format)
+Silver Output: s3a://day-7-spark-glue/silver/zones_cleaned/ (Delta format)
+Gold Output: s3a://day-7-spark-glue/gold/taxi_zones_master/ (Delta format)
 """
 
 import sys
 
-from pyspark.sql import SparkSession
 from pyspark.sql.functions import (
     col,
     current_timestamp,
@@ -27,38 +26,15 @@ from pyspark.sql.functions import (
     monotonically_increasing_id,
     when,
 )
+from spark_session import create_spark_session
 
 # ============================================
 # CONFIGURATION
 # ============================================
-S3_BUCKET = "day-6-datalake-nyc-data"
-BRONZE_ZONES_PATH = f"s3://{S3_BUCKET}/bronze/taxi_zones/"
-SILVER_ZONES_PATH = f"s3://{S3_BUCKET}/silver/zones_cleaned/"
-GOLD_ZONES_MASTER_PATH = f"s3://{S3_BUCKET}/gold/taxi_zones_master/"
-
-
-# ============================================
-# INITIALIZE SPARK SESSION
-# ============================================
-def create_spark_session():
-    """Create and configure Spark session for S3 access with Delta Lake support."""
-    spark = (
-        SparkSession.builder.appName("ZoneDataTransformations")
-        .config("spark.sql.adaptive.enabled", "true")
-        .config("spark.sql.adaptive.coalescePartitions.enabled", "true")
-        .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
-        .config(
-            "spark.sql.catalog.spark_catalog",
-            "org.apache.spark.sql.delta.catalog.DeltaCatalog",
-        )
-        .config("spark.databricks.delta.retentionDurationCheck.enabled", "false")
-        .getOrCreate()
-    )
-
-    # Set log level to reduce noise
-    spark.sparkContext.setLogLevel("WARN")
-
-    return spark
+S3_BUCKET = "day-7-spark-glue"
+BRONZE_ZONES_PATH = f"s3a://{S3_BUCKET}/bronze/taxi_zones/"
+SILVER_ZONES_PATH = f"s3a://{S3_BUCKET}/silver/zones_cleaned/"
+GOLD_ZONES_MASTER_PATH = f"s3a://{S3_BUCKET}/gold/taxi_zones_master/"
 
 
 def read_bronze_csv_data(spark, path):
@@ -76,7 +52,9 @@ def read_bronze_csv_data(spark, path):
         print("Format: CSV")
         print(f"Records Read: {record_count:,}")
         print(f"Columns: {len(df.columns)}")
-        print(f"Schema: {', '.join([f'{c.name}:{c.dataType.simpleString()}' for c in df.schema.fields])}")
+        print(
+            f"Schema: {', '.join([f'{c.name}:{c.dataType.simpleString()}' for c in df.schema.fields])}"
+        )
         return df
     except Exception as csv_error:
         print(f"CSV read failed: {csv_error}")
@@ -183,7 +161,7 @@ def write_silver_delta(df, path):
             "overwriteSchema", "true"
         ).save(path)
         record_count = df.count()
-        print(f"Format: Delta")
+        print("Format: Delta")
         print(f"Records Written: {record_count:,}")
         print(f"Columns: {len(df.columns)}")
         return record_count
@@ -202,7 +180,7 @@ def write_gold_delta(df, path):
             "overwriteSchema", "true"
         ).save(path)
         record_count = df.count()
-        print(f"Format: Delta")
+        print("Format: Delta")
         print(f"Records Written: {record_count:,}")
         print(f"Columns: {len(df.columns)}")
         return record_count
@@ -246,7 +224,7 @@ def main():
     print("=" * 60)
 
     # Initialize Spark with Delta Lake support
-    spark = create_spark_session()
+    spark = create_spark_session("ZoneDataTransformations")
 
     try:
         # Step 1: Read bronze zone data (CSV format)

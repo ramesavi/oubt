@@ -12,13 +12,12 @@ Output Table: trip_metrics
 Important: Day 7 focuses on TRANSFORMATIONS ONLY - no validation or quality checks.
 All records are aggregated without filtering. Day 8 will analyze quality of aggregations.
 
-Input: s3://day-6-datalake-nyc-data/silver/trips_cleaned/ (Delta format)
-Output: s3://day-6-datalake-nyc-data/gold/trip_metrics/ (Delta format, partitioned by trip_date)
+Input: s3a://day-7-spark-glue/silver/trips_cleaned/ (Delta format)
+Output: s3a://day-7-spark-glue/gold/trip_metrics/ (Delta format, partitioned by trip_date)
 """
 
 import sys
 
-from pyspark.sql import SparkSession
 from pyspark.sql.functions import (
     avg,
     count,
@@ -26,44 +25,17 @@ from pyspark.sql.functions import (
 )
 from pyspark.sql.functions import round as spark_round
 from pyspark.sql.functions import sum as spark_sum
+from spark_session import create_spark_session
 
 # ============================================
 # CONFIGURATION
 # ============================================
-S3_BUCKET = "day-6-datalake-nyc-data"
-SILVER_TRIPS_PATH = f"s3://{S3_BUCKET}/silver/trips_cleaned/"
-GOLD_PATH = f"s3://{S3_BUCKET}/gold"
+S3_BUCKET = "day-7-spark-glue"
+SILVER_TRIPS_PATH = f"s3a://{S3_BUCKET}/silver/trips_cleaned/"
+GOLD_PATH = f"s3a://{S3_BUCKET}/gold"
 
 # Single output path for consolidated fact table
 GOLD_TRIP_METRICS_PATH = f"{GOLD_PATH}/trip_metrics/"
-
-# Delta Lake configuration
-DELTA_PACKAGES = "io.delta:delta-spark_2.12:3.2.0"
-
-
-# ============================================
-# INITIALIZE SPARK SESSION
-# ============================================
-def create_spark_session():
-    """Create and configure Spark session for S3 access with Delta Lake support."""
-    spark = (
-        SparkSession.builder.appName("AggregationTransformations")
-        .config("spark.sql.adaptive.enabled", "true")
-        .config("spark.sql.adaptive.coalescePartitions.enabled", "true")
-        # Delta Lake configurations
-        .config("spark.jars.packages", DELTA_PACKAGES)
-        .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
-        .config(
-            "spark.sql.catalog.spark_catalog",
-            "org.apache.spark.sql.delta.catalog.DeltaCatalog",
-        )
-        .getOrCreate()
-    )
-
-    # Set log level to reduce noise
-    spark.sparkContext.setLogLevel("WARN")
-
-    return spark
 
 
 def read_silver_trips(spark, path):
@@ -252,7 +224,7 @@ def main():
     print("=" * 70)
 
     # Initialize Spark
-    spark = create_spark_session()
+    spark = create_spark_session("AggregationTransformations")
 
     try:
         # Step 1: Read cleaned trips from silver zone (Delta format)

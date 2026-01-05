@@ -14,13 +14,12 @@ Transformation Categories:
 Important: Day 7 focuses on TRANSFORMATIONS ONLY - no validation or quality checks.
 All quality checks happen in Day 8.
 
-Input: s3://day-6-datalake-nyc-data/bronze/yellow_tripdata/
-Output: s3://day-6-datalake-nyc-data/silver/trips_cleaned/
+Input: s3a://day-7-spark-glue/bronze/yellow_tripdata/
+Output: s3a://day-7-spark-glue/silver/trips_cleaned/
 """
 
 import sys
 
-from pyspark.sql import SparkSession
 from pyspark.sql.functions import (
     col,
     current_timestamp,
@@ -32,41 +31,14 @@ from pyspark.sql.functions import (
 )
 from pyspark.sql.functions import round as spark_round
 from pyspark.sql.types import DoubleType
+from spark_session import create_spark_session
 
 # ============================================
 # CONFIGURATION
 # ============================================
-S3_BUCKET = "day-6-datalake-nyc-data"
-BRONZE_TRIPS_PATH = f"s3://{S3_BUCKET}/bronze/yellow_tripdata/"
-SILVER_TRIPS_PATH = f"s3://{S3_BUCKET}/silver/trips_cleaned/"
-
-# Delta Lake configuration
-DELTA_PACKAGES = "io.delta:delta-spark_2.12:3.2.0"
-
-
-# ============================================
-# INITIALIZE SPARK SESSION
-# ============================================
-def create_spark_session():
-    """Create and configure Spark session for S3 access with Delta Lake support."""
-    spark = (
-        SparkSession.builder.appName("TripDataTransformations")
-        .config("spark.sql.adaptive.enabled", "true")
-        .config("spark.sql.adaptive.coalescePartitions.enabled", "true")
-        # Delta Lake configurations
-        .config("spark.jars.packages", DELTA_PACKAGES)
-        .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
-        .config(
-            "spark.sql.catalog.spark_catalog",
-            "org.apache.spark.sql.delta.catalog.DeltaCatalog",
-        )
-        .getOrCreate()
-    )
-
-    # Set log level to reduce noise
-    spark.sparkContext.setLogLevel("WARN")
-
-    return spark
+S3_BUCKET = "day-7-spark-glue"
+BRONZE_TRIPS_PATH = f"s3a://{S3_BUCKET}/bronze/yellow_tripdata/"
+SILVER_TRIPS_PATH = f"s3a://{S3_BUCKET}/silver/trips_cleaned/"
 
 
 def read_bronze_data(spark, path):
@@ -102,8 +74,8 @@ def add_time_based_fields(df):
             "trip_duration_minutes",
             spark_round(
                 (
-                    col("tpep_dropoff_datetime").cast("long")
-                    - col("tpep_pickup_datetime").cast("long")
+                    col("tpep_dropoff_datetime").cast("timestamp").cast("long")
+                    - col("tpep_pickup_datetime").cast("timestamp").cast("long")
                 )
                 / 60.0,
                 2,
@@ -332,7 +304,7 @@ def main():
     print("=" * 60)
 
     # Initialize Spark
-    spark = create_spark_session()
+    spark = create_spark_session("TripDataTransformations")
 
     try:
         # Step 1: Read bronze data
