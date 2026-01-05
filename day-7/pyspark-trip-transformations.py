@@ -42,7 +42,7 @@ SILVER_TRIPS_PATH = f"s3a://{S3_BUCKET}/silver/trips_cleaned/"
 
 
 def read_bronze_data(spark, path):
-    """Read parquet data from bronze zone."""
+    """Read parquet data from bronze zone and convert timestamp_ntz to timestamp."""
     print("\n=== Reading Bronze Data ===")
     print(f"Path: {path}")
 
@@ -51,6 +51,17 @@ def read_bronze_data(spark, path):
         record_count = df.count()
         print(f"Records Read: {record_count:,}")
         print(f"Columns: {len(df.columns)}")
+
+        # Convert timestamp_ntz columns to regular timestamp for Glue compatibility
+        # Spark 3.4+ reads timestamps as timestamp_ntz which requires Delta reader v3
+        # AWS Glue crawlers don't support Delta reader v3, so we cast to timestamp
+        from pyspark.sql.types import TimestampNTZType, TimestampType
+
+        for field in df.schema.fields:
+            if isinstance(field.dataType, TimestampNTZType):
+                print(f"  Converting {field.name} from timestamp_ntz to timestamp")
+                df = df.withColumn(field.name, col(field.name).cast(TimestampType()))
+
         return df
     except Exception as e:
         print(f"Error reading bronze data: {e}")

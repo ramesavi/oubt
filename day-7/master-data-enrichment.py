@@ -170,7 +170,10 @@ def write_enriched_data(df, path):
         df = df.withColumn("enriched_at", current_timestamp())
 
         # Write to silver zone in Delta format
-        df.write.format("delta").mode("overwrite").save(path)
+        # Use overwriteSchema to handle schema changes (e.g., timestamp_ntz to timestamp)
+        df.write.format("delta").mode("overwrite").option(
+            "overwriteSchema", "true"
+        ).save(path)
 
         # Get record count for summary
         record_count = df.count()
