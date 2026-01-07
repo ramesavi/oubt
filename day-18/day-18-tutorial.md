@@ -116,11 +116,17 @@ import time
 from datetime import datetime
 
 class CloudWatchLogger:
+    """
+    CloudWatch Logs wrapper for structured logging.
+    
+    Note: Prior to 2023, CloudWatch Logs required tracking a sequenceToken
+    for each put_log_events call. This is no longer required - AWS now
+    handles sequencing automatically.
+    """
     def __init__(self, log_group: str, log_stream: str):
         self.client = boto3.client('logs')
         self.log_group = log_group
         self.log_stream = log_stream
-        self.sequence_token = None
         self._ensure_log_group()
         self._ensure_log_stream()
     
@@ -140,6 +146,12 @@ class CloudWatchLogger:
             pass
     
     def log(self, level: str, message: str, **kwargs):
+        """
+        Log a message to CloudWatch Logs.
+        
+        Note: As of 2023, sequenceToken is no longer required for put_log_events.
+        AWS handles sequencing automatically, simplifying the logging code.
+        """
         log_event = {
             'level': level,
             'message': message,
@@ -147,20 +159,17 @@ class CloudWatchLogger:
             **kwargs
         }
         
-        params = {
-            'logGroupName': self.log_group,
-            'logStreamName': self.log_stream,
-            'logEvents': [{
-                'timestamp': int(time.time() * 1000),
-                'message': json.dumps(log_event)
-            }]
-        }
+        log_events = [{
+            'timestamp': int(time.time() * 1000),
+            'message': json.dumps(log_event)
+        }]
         
-        if self.sequence_token:
-            params['sequenceToken'] = self.sequence_token
-        
-        response = self.client.put_log_events(**params)
-        self.sequence_token = response.get('nextSequenceToken')
+        # sequenceToken handling removed - no longer needed as of 2023
+        response = self.client.put_log_events(
+            logGroupName=self.log_group,
+            logStreamName=self.log_stream,
+            logEvents=log_events
+        )
     
     def info(self, message: str, **kwargs):
         self.log('INFO', message, **kwargs)
@@ -843,6 +852,8 @@ spark.conf.set("spark.sql.adaptive.skewJoin.skewedPartitionThresholdInBytes", "2
 ### 8.4 Caching
 
 ```python
+from pyspark import StorageLevel
+
 # Cache frequently used data
 df.cache()  # Memory only
 df.persist(StorageLevel.MEMORY_AND_DISK)  # Memory + disk
@@ -890,6 +901,80 @@ delta_table.optimize().executeZOrderBy("pickup_date", "pickup_location_id")
 # Vacuum old files
 delta_table.vacuum(168)  # 7 days retention
 ```
+
+### Z-Ordering Explained
+
+**Z-ordering** (also called multi-dimensional clustering) is a technique that co-locates related data in the same files to improve query performance.
+
+**How it works:**
+- Z-ordering interleaves the bits of multiple column values to create a single ordering
+- Data points that are close in multiple dimensions end up close in storage
+- This enables efficient data skipping when filtering on any of the Z-ordered columns
+
+```mermaid
+%%{init: {'theme':'neutral'}}%%
+flowchart LR
+    subgraph Before["Before Z-Ordering"]
+        F1["File 1: Mixed dates & locations"]
+        F2["File 2: Mixed dates & locations"]
+        F3["File 3: Mixed dates & locations"]
+    end
+    
+    subgraph After["After Z-Ordering"]
+        Z1["File 1: Jan + Manhattan"]
+        Z2["File 2: Jan + Brooklyn"]
+        Z3["File 3: Feb + Manhattan"]
+    end
+    
+    Before --> ZOrder["Z-Order by date, location"]
+    ZOrder --> After
+    
+    style F1 fill:#868e96,color:#000
+    style F2 fill:#868e96,color:#000
+    style F3 fill:#868e96,color:#000
+    style Z1 fill:#51cf66,color:#000
+    style Z2 fill:#51cf66,color:#000
+    style Z3 fill:#51cf66,color:#000
+    style ZOrder fill:#74c0fc,color:#000
+```
+
+**When to use Z-ordering:**
+
+| Good Candidates | Poor Candidates |
+|-----------------|-----------------|
+| Columns frequently used together in WHERE clauses | Columns already used for partitioning |
+| High-cardinality columns (many distinct values) | Low-cardinality columns (few values) |
+| Columns not used for partitioning | Columns rarely filtered on |
+
+**Example with Delta Lake:**
+
+```python
+from delta.tables import DeltaTable
+
+delta_table = DeltaTable.forPath(spark, "s3://taxi-data/delta/trips")
+
+# Z-order by columns commonly filtered together
+# This optimizes queries like: WHERE pickup_date = '2025-01-01' AND PULocationID = 132
+delta_table.optimize().executeZOrderBy("pickup_date", "PULocationID")
+
+# For time-series data with location filtering
+delta_table.optimize().executeZOrderBy("tpep_pickup_datetime", "PULocationID", "DOLocationID")
+```
+
+**Trade-offs:**
+
+| Benefit | Cost |
+|---------|------|
+| Faster queries with multi-column filters | Computationally expensive operation |
+| Better data skipping | Should run during off-peak hours |
+| Reduced data scanned | Needs periodic re-runs as new data arrives |
+
+**Best Practices:**
+1. Z-order on 2-4 columns maximum (diminishing returns beyond that)
+2. Choose columns based on actual query patterns
+3. Run Z-ordering after significant data ingestion (e.g., daily or weekly)
+4. Combine with OPTIMIZE for best results
+5. Monitor query performance before and after to validate improvement
 
 ### 9.3 Storage Tiering
 

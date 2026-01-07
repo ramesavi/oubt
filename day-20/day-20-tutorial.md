@@ -98,9 +98,40 @@ aws s3 ls s3://nyc-taxi-master-data/golden_records/ --recursive | head -5
 
 # Verify record counts
 echo "=== Record Counts ==="
-aws athena start-query-execution \
+QUERY_EXECUTION_ID=$(aws athena start-query-execution \
     --query-string "SELECT COUNT(*) FROM taxi_db.yellow_trips" \
-    --result-configuration OutputLocation=s3://athena-results/
+    --result-configuration OutputLocation=s3://athena-results/ \
+    --query 'QueryExecutionId' \
+    --output text)
+
+echo "Query Execution ID: $QUERY_EXECUTION_ID"
+
+# Wait for query to complete
+echo "Waiting for query to complete..."
+aws athena wait query-execution-complete \
+    --query-execution-id $QUERY_EXECUTION_ID
+
+# Check query status
+QUERY_STATUS=$(aws athena get-query-execution \
+    --query-execution-id $QUERY_EXECUTION_ID \
+    --query 'QueryExecution.Status.State' \
+    --output text)
+
+echo "Query Status: $QUERY_STATUS"
+
+# Get results if successful
+if [ "$QUERY_STATUS" = "SUCCEEDED" ]; then
+    echo "=== Query Results ==="
+    aws athena get-query-results \
+        --query-execution-id $QUERY_EXECUTION_ID \
+        --query 'ResultSet.Rows[*].Data[*].VarCharValue' \
+        --output table
+else
+    echo "Query failed. Check execution details:"
+    aws athena get-query-execution \
+        --query-execution-id $QUERY_EXECUTION_ID \
+        --query 'QueryExecution.Status'
+fi
 ```
 
 #### Application Verification
@@ -1333,6 +1364,29 @@ Before your demo, ensure you've completed:
 - [ ] Code repository organized and documented
 - [ ] Presentation slides ready
 - [ ] Recording equipment tested
+
+---
+
+## Glossary
+
+This glossary defines key terms used throughout the training program that may not be immediately familiar:
+
+| Term | Definition |
+|------|------------|
+| **ACID Transactions** | A set of properties (Atomicity, Consistency, Isolation, Durability) that guarantee database transactions are processed reliably. Delta Lake provides ACID transactions for data lakes, ensuring data integrity even with concurrent reads and writes. |
+| **Blocking (in matching)** | A technique used in record matching/deduplication to reduce the number of comparisons by grouping records into "blocks" based on shared attributes (e.g., first letter of last name). Only records within the same block are compared, dramatically improving performance. |
+| **Job Bookmarks** | An AWS Glue feature that tracks data already processed by a job, enabling incremental processing. When enabled, Glue remembers which data has been processed and only processes new data in subsequent runs. |
+| **RA3 Nodes** | Amazon Redshift's latest node type that separates compute and storage. RA3 nodes use managed storage that automatically scales, allowing you to scale compute independently of storage and pay only for the storage you use. |
+| **SPICE Dataset** | Super-fast, Parallel, In-memory Calculation Engine - QuickSight's in-memory storage that enables fast dashboard performance. Data is imported into SPICE for rapid querying without hitting the underlying data source. |
+| **DPU (Data Processing Unit)** | A relative measure of processing power in AWS Glue. One DPU provides 4 vCPUs and 16 GB of memory. Glue jobs are billed per DPU-hour. |
+| **SCD (Slowly Changing Dimension)** | A data warehousing concept for tracking changes to dimension data over time. Type 1 overwrites, Type 2 creates new rows with history, Type 3 adds columns for previous values. |
+| **Golden Record** | The single, authoritative version of a master data entity created by merging and reconciling data from multiple sources. Represents the "best" or most accurate version of the truth. |
+| **Envelope Encryption** | A strategy where data is encrypted with a data key, and the data key is then encrypted with a master key. This approach is efficient for large datasets and is used by AWS KMS. |
+| **Data Lineage** | The tracking of data's origins, movements, and transformations throughout its lifecycle. Helps answer "where did this data come from?" and "what happened to it?" |
+| **Partition Pruning** | A query optimization technique where the query engine skips reading partitions that don't match the query's filter conditions, significantly reducing data scanned and improving performance. |
+| **Z-Ordering** | A multi-dimensional clustering technique that co-locates related data in the same files based on multiple columns, enabling efficient data skipping for queries filtering on those columns. |
+| **Idempotency** | The property of an operation where performing it multiple times produces the same result as performing it once. Critical for reliable data pipelines that may retry failed operations. |
+| **Survivorship Rules** | Business rules that determine which value "survives" when merging duplicate records. For example, "most recent value wins" or "source system A takes precedence over source system B." |
 
 ---
 

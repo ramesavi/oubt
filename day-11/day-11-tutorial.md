@@ -223,17 +223,23 @@ The **Wait** state delays the workflow for a specified time.
 
 **Wait Options:**
 
+Wait for a specific number of seconds:
 ```json
-// Wait for specific number of seconds
 { "Seconds": 300 }
+```
 
-// Wait until a specific timestamp
+Wait until a specific timestamp:
+```json
 { "Timestamp": "2024-01-15T12:00:00Z" }
+```
 
-// Wait using a value from input
+Wait using a value from input:
+```json
 { "SecondsPath": "$.wait_time" }
+```
 
-// Wait until timestamp from input
+Wait until timestamp from input:
+```json
 { "TimestampPath": "$.scheduled_time" }
 ```
 
@@ -1071,37 +1077,77 @@ Idempotency ensures that running the same operation multiple times produces the 
 import boto3
 import hashlib
 from datetime import datetime
+from botocore.exceptions import ClientError
+
+dynamodb = boto3.resource('dynamodb')
 
 def generate_idempotency_key(source_file: str, processing_date: str) -> str:
     """Generate a unique idempotency key for a processing job."""
     key_string = f"{source_file}:{processing_date}"
     return hashlib.sha256(key_string.encode()).hexdigest()
 
-def process_with_idempotency(source_file: str, processing_date: str):
-    """Process data with idempotency check."""
-    dynamodb = boto3.resource('dynamodb')
-    table = dynamodb.Table('pipeline-idempotency')
-    
-    idempotency_key = generate_idempotency_key(source_file, processing_date)
+def perform_processing(payload: dict) -> dict:
+    """Placeholder for actual data processing logic."""
+    # Your actual processing logic here
+    return {"status": "success", "records_processed": 1000}
+
+def process_with_idempotency(event_id: str, payload: dict) -> dict:
+    """Process with idempotency check using DynamoDB."""
+    table = dynamodb.Table('idempotency_keys')
     
     try:
+        # Check if already processed - attempt to claim the event
         table.put_item(
             Item={
-                'idempotency_key': idempotency_key,
-                'status': 'IN_PROGRESS',
+                'event_id': event_id,
+                'status': 'processing',
                 'created_at': datetime.utcnow().isoformat(),
-                'source_file': source_file
+                'payload': payload
             },
-            ConditionExpression='attribute_not_exists(idempotency_key)'
+            ConditionExpression='attribute_not_exists(event_id)'
         )
-    except dynamodb.meta.client.exceptions.ConditionalCheckFailedException:
-        response = table.get_item(Key={'idempotency_key': idempotency_key})
-        existing = response.get('Item', {})
-        if existing.get('status') == 'COMPLETED':
-            return existing.get('result')
-        raise Exception("Processing already in progress")
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'ConditionalCheckFailedException':
+            # Already processed - return cached result
+            existing = table.get_item(Key={'event_id': event_id})
+            return existing.get('Item', {}).get('result', {'status': 'duplicate'})
+        raise
     
-    # Perform processing and update status...
+    try:
+        # Perform actual processing
+        result = perform_processing(payload)
+        
+        # Update status to completed
+        table.update_item(
+            Key={'event_id': event_id},
+            UpdateExpression='SET #status = :status, #result = :result, completed_at = :completed',
+            ExpressionAttributeNames={'#status': 'status', '#result': 'result'},
+            ExpressionAttributeValues={
+                ':status': 'completed',
+                ':result': result,
+                ':completed': datetime.utcnow().isoformat()
+            }
+        )
+        return result
+    except Exception as e:
+        # Update status to failed
+        table.update_item(
+            Key={'event_id': event_id},
+            UpdateExpression='SET #status = :status, error = :error',
+            ExpressionAttributeNames={'#status': 'status'},
+            ExpressionAttributeValues={':status': 'failed', ':error': str(e)}
+        )
+        raise
+
+# Usage example
+def lambda_handler(event, context):
+    """Lambda handler with idempotency."""
+    event_id = event.get('event_id') or generate_idempotency_key(
+        event.get('source_file', ''),
+        event.get('processing_date', datetime.utcnow().strftime('%Y-%m-%d'))
+    )
+    
+    return process_with_idempotency(event_id, event)
 ```
 
 ---
@@ -1378,10 +1424,35 @@ aws s3api put-bucket-lifecycle-configuration \
 
 ### 6.4 Glue Cost Optimization
 
+> **DPU (Data Processing Unit)**: A DPU is a relative measure of processing power in AWS Glue. One DPU provides 4 vCPUs and 16 GB of memory. Glue jobs are billed per DPU-hour, so optimizing DPU usage directly impacts cost. Standard Glue jobs default to 10 DPUs, while Glue ETL jobs can use between 2-100 DPUs.
+
+**Optimization Strategies:**
+
 - Use **Glue 4.0** for better performance and lower costs
-- Enable **Auto Scaling** to adjust DPUs dynamically
-- Use **job bookmarks** to process only new data
+- Enable **Auto Scaling** to adjust DPUs dynamically (min 2 to max 10 DPUs recommended for most jobs)
+- Use **job bookmarks** to process only new data incrementally
 - Schedule jobs during off-peak hours when possible
+- Use **Glue Flex execution** for non-urgent jobs (up to 35% cost savings)
+- Monitor DPU utilization with CloudWatch metrics and right-size accordingly
+
+```python
+# Example: Glue job with auto-scaling configuration
+import sys
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+
+# Auto-scaling is configured in the job parameters:
+# --enable-auto-scaling true
+# --min-workers 2
+# --max-workers 10
+
+args = getResolvedOptions(sys.argv, ['JOB_NAME'])
+sc = SparkContext()
+glueContext = GlueContext(sc)
+
+# Your ETL logic here...
+```
 
 ---
 

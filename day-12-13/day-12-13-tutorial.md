@@ -278,7 +278,7 @@ ORDER BY dt.trip_date;
 WITH RECURSIVE date_series AS (
     SELECT DATE '2025-08-01' AS date_value
     UNION ALL
-    SELECT date_value + INTERVAL '1 day'
+    SELECT (date_value + INTERVAL '1 day')::DATE
     FROM date_series
     WHERE date_value < DATE '2025-08-31'
 )
@@ -293,6 +293,215 @@ SELECT date_value FROM date_series;
 | **Reusability** | Can reference multiple times | Must repeat |
 | **Optimization** | PostgreSQL may materialize | Optimizer can inline |
 | **Recursion** | Supports recursive queries | No recursion support |
+
+---
+
+## Window Functions for Analytics
+
+Window functions perform calculations across a set of rows related to the current row, without collapsing the result set like GROUP BY does. They are essential for analytics, time-series analysis, and ranking operations.
+
+### Basic Window Function Syntax
+
+```sql
+-- Running total of fares by day
+SELECT
+    trip_id,
+    tpep_pickup_datetime,
+    fare_amount,
+    SUM(fare_amount) OVER (
+        PARTITION BY DATE(tpep_pickup_datetime)
+        ORDER BY tpep_pickup_datetime
+        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) AS running_daily_total
+FROM yellow_taxi_trips
+WHERE tpep_pickup_datetime >= '2025-08-01';
+```
+
+### Ranking Functions
+
+```sql
+-- Rank trips by fare within each pickup location
+SELECT
+    trip_id,
+    PULocationID,
+    fare_amount,
+    ROW_NUMBER() OVER (PARTITION BY PULocationID ORDER BY fare_amount DESC) AS row_num,
+    RANK() OVER (PARTITION BY PULocationID ORDER BY fare_amount DESC) AS rank,
+    DENSE_RANK() OVER (PARTITION BY PULocationID ORDER BY fare_amount DESC) AS dense_rank
+FROM yellow_taxi_trips
+WHERE fare_amount > 0;
+```
+
+**Ranking Function Differences:**
+
+| Function | Behavior with Ties | Example (values: 100, 100, 90) |
+|----------|-------------------|-------------------------------|
+| `ROW_NUMBER()` | Unique sequential numbers | 1, 2, 3 |
+| `RANK()` | Same rank for ties, gaps after | 1, 1, 3 |
+| `DENSE_RANK()` | Same rank for ties, no gaps | 1, 1, 2 |
+
+### LAG and LEAD for Time-Series Analysis
+
+```sql
+-- Compare each trip's fare to the previous and next trip
+SELECT
+    trip_id,
+    tpep_pickup_datetime,
+    fare_amount,
+    LAG(fare_amount, 1) OVER (ORDER BY tpep_pickup_datetime) AS prev_fare,
+    LEAD(fare_amount, 1) OVER (ORDER BY tpep_pickup_datetime) AS next_fare,
+    fare_amount - LAG(fare_amount, 1) OVER (ORDER BY tpep_pickup_datetime) AS fare_change
+FROM yellow_taxi_trips
+ORDER BY tpep_pickup_datetime;
+
+-- Analyze trip patterns by comparing to previous trip at same location
+SELECT
+    trip_id,
+    PULocationID,
+    tpep_pickup_datetime,
+    fare_amount,
+    LAG(tpep_pickup_datetime) OVER (
+        PARTITION BY PULocationID
+        ORDER BY tpep_pickup_datetime
+    ) AS prev_pickup_at_location,
+    EXTRACT(EPOCH FROM (
+        tpep_pickup_datetime - LAG(tpep_pickup_datetime) OVER (
+            PARTITION BY PULocationID
+            ORDER BY tpep_pickup_datetime
+        )
+    )) / 60 AS minutes_since_last_pickup
+FROM yellow_taxi_trips
+WHERE tpep_pickup_datetime >= '2025-08-01';
+```
+
+### Moving Averages
+
+```sql
+-- 7-day moving average of daily trip counts
+WITH daily_counts AS (
+    SELECT
+        DATE(tpep_pickup_datetime) AS trip_date,
+        COUNT(*) AS trip_count
+    FROM yellow_taxi_trips
+    GROUP BY DATE(tpep_pickup_datetime)
+)
+SELECT
+    trip_date,
+    trip_count,
+    AVG(trip_count) OVER (
+        ORDER BY trip_date
+        ROWS BETWEEN 6 PRECEDING AND CURRENT ROW
+    ) AS moving_avg_7day
+FROM daily_counts;
+
+-- Moving average with minimum window size
+WITH daily_counts AS (
+    SELECT
+        DATE(tpep_pickup_datetime) AS trip_date,
+        COUNT(*) AS trip_count,
+        SUM(fare_amount) AS daily_revenue
+    FROM yellow_taxi_trips
+    GROUP BY DATE(tpep_pickup_datetime)
+)
+SELECT
+    trip_date,
+    trip_count,
+    daily_revenue,
+    CASE
+        WHEN COUNT(*) OVER (ORDER BY trip_date ROWS BETWEEN 6 PRECEDING AND CURRENT ROW) >= 7
+        THEN AVG(trip_count) OVER (ORDER BY trip_date ROWS BETWEEN 6 PRECEDING AND CURRENT ROW)
+        ELSE NULL
+    END AS moving_avg_7day,
+    AVG(daily_revenue) OVER (
+        ORDER BY trip_date
+        ROWS BETWEEN 29 PRECEDING AND CURRENT ROW
+    ) AS moving_avg_30day_revenue
+FROM daily_counts;
+```
+
+### FIRST_VALUE and LAST_VALUE
+
+```sql
+-- Compare each trip to the first and last trip of the day
+SELECT
+    trip_id,
+    tpep_pickup_datetime,
+    fare_amount,
+    FIRST_VALUE(fare_amount) OVER (
+        PARTITION BY DATE(tpep_pickup_datetime)
+        ORDER BY tpep_pickup_datetime
+    ) AS first_fare_of_day,
+    LAST_VALUE(fare_amount) OVER (
+        PARTITION BY DATE(tpep_pickup_datetime)
+        ORDER BY tpep_pickup_datetime
+        ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+    ) AS last_fare_of_day
+FROM yellow_taxi_trips
+WHERE tpep_pickup_datetime >= '2025-08-01';
+```
+
+### NTILE for Percentile Buckets
+
+```sql
+-- Divide trips into quartiles by fare amount
+SELECT
+    trip_id,
+    fare_amount,
+    NTILE(4) OVER (ORDER BY fare_amount) AS fare_quartile,
+    NTILE(10) OVER (ORDER BY fare_amount) AS fare_decile,
+    NTILE(100) OVER (ORDER BY fare_amount) AS fare_percentile
+FROM yellow_taxi_trips
+WHERE fare_amount > 0;
+
+-- Identify top 10% of trips by fare
+WITH ranked_trips AS (
+    SELECT
+        trip_id,
+        fare_amount,
+        NTILE(10) OVER (ORDER BY fare_amount DESC) AS decile
+    FROM yellow_taxi_trips
+    WHERE fare_amount > 0
+)
+SELECT * FROM ranked_trips WHERE decile = 1;
+```
+
+### Window Frame Specifications
+
+```sql
+-- Different window frame examples
+SELECT
+    trip_id,
+    tpep_pickup_datetime,
+    fare_amount,
+    -- All rows from start to current row
+    SUM(fare_amount) OVER (
+        ORDER BY tpep_pickup_datetime
+        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) AS cumulative_sum,
+    -- Current row and 2 rows before/after
+    AVG(fare_amount) OVER (
+        ORDER BY tpep_pickup_datetime
+        ROWS BETWEEN 2 PRECEDING AND 2 FOLLOWING
+    ) AS centered_avg,
+    -- All rows in the partition
+    AVG(fare_amount) OVER (
+        PARTITION BY DATE(tpep_pickup_datetime)
+    ) AS daily_avg
+FROM yellow_taxi_trips
+WHERE tpep_pickup_datetime >= '2025-08-01';
+```
+
+### Window Functions Summary
+
+| Function | Purpose | Example Use Case |
+|----------|---------|------------------|
+| `ROW_NUMBER()` | Unique sequential numbering | Pagination, deduplication |
+| `RANK()` | Ranking with gaps | Competition rankings |
+| `DENSE_RANK()` | Ranking without gaps | Top-N analysis |
+| `LAG()/LEAD()` | Access previous/next rows | Time-series comparison |
+| `FIRST_VALUE()/LAST_VALUE()` | First/last in window | Daily open/close values |
+| `NTILE(n)` | Divide into n buckets | Percentile analysis |
+| `SUM()/AVG()/COUNT() OVER` | Running aggregations | Cumulative totals |
 
 ---
 
@@ -1207,13 +1416,473 @@ CALL lab_run_test_suite();
 
 **Objective**: Document SQL transformations following best practices.
 
+**Tasks**:
+1. Create a data dictionary for the taxi trip tables
+2. Document transformation lineage for materialized views
+3. Write inline documentation for all functions created in previous labs
+
+```sql
+-- Lab 4 Solution Template
+
+-- Step 1: Create comprehensive data dictionary entries
+INSERT INTO data_dictionary (schema_name, table_name, column_name, object_type, description, data_type)
+VALUES
+    -- Table-level documentation
+    ('public', 'yellow_taxi_trips', NULL, 'table',
+     'NYC Yellow Taxi trip records containing pickup/dropoff times, locations, fares, and trip metrics. Source: NYC TLC.', NULL),
+    
+    -- Column-level documentation
+    ('public', 'yellow_taxi_trips', 'trip_id', 'column',
+     'Unique identifier for each trip record (auto-generated)', 'BIGSERIAL'),
+    ('public', 'yellow_taxi_trips', 'tpep_pickup_datetime', 'column',
+     'Date and time when the meter was engaged', 'TIMESTAMP'),
+    ('public', 'yellow_taxi_trips', 'tpep_dropoff_datetime', 'column',
+     'Date and time when the meter was disengaged', 'TIMESTAMP'),
+    ('public', 'yellow_taxi_trips', 'passenger_count', 'column',
+     'Number of passengers in the vehicle (driver-reported)', 'INTEGER'),
+    ('public', 'yellow_taxi_trips', 'trip_distance', 'column',
+     'Elapsed trip distance in miles reported by the taximeter', 'NUMERIC(10,2)'),
+    ('public', 'yellow_taxi_trips', 'PULocationID', 'column',
+     'TLC Taxi Zone where the meter was engaged (FK to taxi_zones)', 'INTEGER'),
+    ('public', 'yellow_taxi_trips', 'DOLocationID', 'column',
+     'TLC Taxi Zone where the meter was disengaged (FK to taxi_zones)', 'INTEGER'),
+    ('public', 'yellow_taxi_trips', 'fare_amount', 'column',
+     'Time-and-distance fare calculated by the meter in USD', 'NUMERIC(10,2)'),
+    ('public', 'yellow_taxi_trips', 'total_amount', 'column',
+     'Total amount charged to passengers (fare + extras + tips + tolls)', 'NUMERIC(10,2)');
+
+-- Step 2: Document transformation lineage
+INSERT INTO transformation_lineage (target_table, target_column, source_tables, transformation_logic, description)
+VALUES
+    ('mv_daily_trip_stats', 'trip_date', ARRAY['yellow_taxi_trips'],
+     'DATE(tpep_pickup_datetime)', 'Truncated pickup datetime to date'),
+    ('mv_daily_trip_stats', 'total_trips', ARRAY['yellow_taxi_trips'],
+     'COUNT(*) GROUP BY DATE(tpep_pickup_datetime)', 'Count of all trips per day'),
+    ('mv_daily_trip_stats', 'total_fare', ARRAY['yellow_taxi_trips'],
+     'SUM(fare_amount) GROUP BY DATE(tpep_pickup_datetime)', 'Sum of all fare amounts per day'),
+    ('mv_daily_trip_stats', 'avg_distance', ARRAY['yellow_taxi_trips'],
+     'AVG(trip_distance) GROUP BY DATE(tpep_pickup_datetime)', 'Average trip distance per day'),
+    ('mv_location_analytics', 'pickup_count', ARRAY['yellow_taxi_trips', 'taxi_zones'],
+     'COUNT(*) GROUP BY PULocationID with JOIN to taxi_zones', 'Count of pickups per location with zone details');
+
+-- Step 3: Create a documentation view for easy access
+CREATE OR REPLACE VIEW v_transformation_documentation AS
+SELECT
+    tl.target_table,
+    tl.target_column,
+    array_to_string(tl.source_tables, ', ') AS source_tables,
+    tl.transformation_logic,
+    tl.description,
+    dd.data_type
+FROM transformation_lineage tl
+LEFT JOIN data_dictionary dd
+    ON dd.table_name = tl.target_table
+    AND dd.column_name = tl.target_column
+ORDER BY tl.target_table, tl.target_column;
+
+-- Query documentation
+SELECT * FROM v_transformation_documentation WHERE target_table = 'mv_daily_trip_stats';
+```
+
 ### Lab 5: Implement SQL Workflows in Glue
 
 **Objective**: Schedule and orchestrate SQL transformations using AWS Glue.
 
+**Tasks**:
+1. Create a Glue job that executes daily aggregation procedures
+2. Set up a scheduled trigger for the job
+3. Implement error handling and notifications
+
+```python
+# Lab 5 Solution: glue_taxi_workflow.py
+import sys
+import boto3
+from datetime import datetime, timedelta
+from awsglue.utils import getResolvedOptions
+import pg8000
+
+# Get job parameters
+args = getResolvedOptions(sys.argv, [
+    'JOB_NAME',
+    'db_host',
+    'db_name',
+    'db_user',
+    'db_password',
+    'process_date',
+    'sns_topic_arn'
+])
+
+sns_client = boto3.client('sns')
+
+def send_notification(subject, message):
+    """Send SNS notification for job status."""
+    try:
+        sns_client.publish(
+            TopicArn=args['sns_topic_arn'],
+            Subject=subject,
+            Message=message
+        )
+    except Exception as e:
+        print(f"Failed to send notification: {e}")
+
+def get_connection():
+    """Create database connection."""
+    return pg8000.connect(
+        host=args['db_host'],
+        database=args['db_name'],
+        user=args['db_user'],
+        password=args['db_password']
+    )
+
+def execute_sql(conn, sql, params=None):
+    """Execute SQL statement with optional parameters."""
+    cursor = conn.cursor()
+    if params:
+        cursor.execute(sql, params)
+    else:
+        cursor.execute(sql)
+    conn.commit()
+    return cursor
+
+def run_daily_workflow(process_date):
+    """Execute the complete daily workflow."""
+    conn = None
+    steps_completed = []
+    
+    try:
+        conn = get_connection()
+        
+        # Step 1: Run data quality checks
+        print(f"Step 1: Running data quality checks for {process_date}")
+        execute_sql(conn, f"CALL lab_run_quality_checks('{process_date}')")
+        steps_completed.append("Data quality checks")
+        
+        # Step 2: Process daily aggregation
+        print(f"Step 2: Processing daily aggregation for {process_date}")
+        execute_sql(conn, f"CALL process_daily_aggregation('{process_date}')")
+        steps_completed.append("Daily aggregation")
+        
+        # Step 3: Refresh materialized views
+        print("Step 3: Refreshing materialized views")
+        execute_sql(conn, "CALL refresh_all_materialized_views()")
+        steps_completed.append("Materialized view refresh")
+        
+        # Step 4: Log completion
+        execute_sql(conn, """
+            INSERT INTO dq_audit_log (check_date, table_name, check_type, check_name, status, details)
+            VALUES (%s, 'workflow', 'daily_workflow', 'complete', 'PASS', %s)
+        """, (process_date, f'{{"steps": {steps_completed}}}'))
+        
+        # Send success notification
+        send_notification(
+            f"Taxi Data Workflow Success - {process_date}",
+            f"Daily workflow completed successfully.\nSteps: {', '.join(steps_completed)}"
+        )
+        
+        print(f"Workflow completed successfully for {process_date}")
+        
+    except Exception as e:
+        error_msg = str(e)
+        print(f"Workflow failed: {error_msg}")
+        
+        # Log failure
+        if conn:
+            try:
+                execute_sql(conn, """
+                    INSERT INTO dq_audit_log (check_date, table_name, check_type, check_name, status, details)
+                    VALUES (%s, 'workflow', 'daily_workflow', 'complete', 'FAIL', %s)
+                """, (process_date, f'{{"error": "{error_msg}", "completed_steps": {steps_completed}}}'))
+            except:
+                pass
+        
+        # Send failure notification
+        send_notification(
+            f"Taxi Data Workflow FAILED - {process_date}",
+            f"Workflow failed with error: {error_msg}\nCompleted steps: {', '.join(steps_completed)}"
+        )
+        raise
+        
+    finally:
+        if conn:
+            conn.close()
+
+# Main execution
+if __name__ == "__main__":
+    process_date = args.get('process_date',
+                           (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d'))
+    run_daily_workflow(process_date)
+```
+
+```bash
+# AWS CLI commands to set up the Glue workflow
+
+# Step 1: Create the Glue job
+aws glue create-job \
+    --name "taxi-daily-workflow" \
+    --role "arn:aws:iam::123456789012:role/GlueServiceRole" \
+    --command '{
+        "Name": "pythonshell",
+        "ScriptLocation": "s3://taxi-data-bucket/scripts/glue_taxi_workflow.py",
+        "PythonVersion": "3.9"
+    }' \
+    --default-arguments '{
+        "--db_host": "taxi-db.cluster-xxx.us-east-1.rds.amazonaws.com",
+        "--db_name": "taxi_analytics",
+        "--db_user": "glue_user",
+        "--sns_topic_arn": "arn:aws:sns:us-east-1:123456789012:taxi-workflow-alerts",
+        "--additional-python-modules": "pg8000"
+    }' \
+    --max-capacity 0.0625 \
+    --timeout 60
+
+# Step 2: Create a scheduled trigger (runs daily at 6 AM UTC)
+aws glue create-trigger \
+    --name "taxi-daily-workflow-trigger" \
+    --type SCHEDULED \
+    --schedule "cron(0 6 * * ? *)" \
+    --actions '[{
+        "JobName": "taxi-daily-workflow",
+        "Arguments": {
+            "--process_date.$": "$.process_date"
+        }
+    }]' \
+    --start-on-creation
+
+# Step 3: Create a workflow for complex orchestration
+aws glue create-workflow --name "taxi-data-pipeline"
+
+# Step 4: Add the trigger to the workflow
+aws glue put-workflow-run-properties \
+    --name "taxi-data-pipeline" \
+    --run-id "latest" \
+    --run-properties '{"process_date": "2025-08-01"}'
+```
+
 ### Lab 6: Version Control SQL Scripts in Git
 
 **Objective**: Set up proper version control for SQL scripts.
+
+**Tasks**:
+1. Organize SQL files following best practices
+2. Create migration scripts with proper versioning
+3. Set up pre-commit hooks for SQL linting
+
+```bash
+# Lab 6 Solution: Project structure and setup
+
+# Step 1: Create the directory structure
+mkdir -p sql/{migrations,functions,procedures,views,tests,seeds}
+
+# Create the directory structure
+cat << 'EOF'
+sql/
+├── migrations/
+│   ├── V001__create_base_tables.sql
+│   ├── V002__add_indexes.sql
+│   ├── V003__create_functions.sql
+│   ├── V004__create_materialized_views.sql
+│   └── V005__add_quality_tables.sql
+├── functions/
+│   ├── calculate_fare_per_mile.sql
+│   ├── categorize_distance.sql
+│   └── check_completeness.sql
+├── procedures/
+│   ├── archive_old_trips.sql
+│   ├── process_daily_aggregation.sql
+│   └── refresh_all_materialized_views.sql
+├── views/
+│   ├── mv_daily_trip_stats.sql
+│   ├── mv_hourly_patterns.sql
+│   └── mv_location_analytics.sql
+├── tests/
+│   ├── test_functions.sql
+│   └── test_data_quality.sql
+├── seeds/
+│   └── taxi_zones.sql
+├── flyway.conf
+└── README.md
+EOF
+```
+
+```sql
+-- sql/migrations/V001__create_base_tables.sql
+-- Migration: Create base tables for taxi analytics
+-- Author: Data Engineering Team
+-- Date: 2025-08-01
+
+CREATE TABLE IF NOT EXISTS yellow_taxi_trips (
+    trip_id BIGSERIAL PRIMARY KEY,
+    tpep_pickup_datetime TIMESTAMP NOT NULL,
+    tpep_dropoff_datetime TIMESTAMP NOT NULL,
+    passenger_count INTEGER,
+    trip_distance NUMERIC(10,2),
+    PULocationID INTEGER NOT NULL,
+    DOLocationID INTEGER NOT NULL,
+    fare_amount NUMERIC(10,2),
+    total_amount NUMERIC(10,2),
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS taxi_zones (
+    LocationID INTEGER PRIMARY KEY,
+    Borough VARCHAR(50),
+    Zone VARCHAR(100),
+    service_zone VARCHAR(50)
+);
+
+-- Add comments for documentation
+COMMENT ON TABLE yellow_taxi_trips IS 'NYC Yellow Taxi trip records';
+COMMENT ON COLUMN yellow_taxi_trips.trip_id IS 'Unique trip identifier';
+COMMENT ON COLUMN yellow_taxi_trips.fare_amount IS 'Base fare in USD';
+```
+
+```sql
+-- sql/migrations/V002__add_indexes.sql
+-- Migration: Add performance indexes
+-- Author: Data Engineering Team
+-- Date: 2025-08-01
+
+CREATE INDEX IF NOT EXISTS idx_trips_pickup_datetime
+    ON yellow_taxi_trips(tpep_pickup_datetime);
+
+CREATE INDEX IF NOT EXISTS idx_trips_pickup_location
+    ON yellow_taxi_trips(PULocationID);
+
+CREATE INDEX IF NOT EXISTS idx_trips_dropoff_location
+    ON yellow_taxi_trips(DOLocationID);
+
+CREATE INDEX IF NOT EXISTS idx_trips_pickup_date
+    ON yellow_taxi_trips(DATE(tpep_pickup_datetime));
+
+-- Composite index for common query patterns
+CREATE INDEX IF NOT EXISTS idx_trips_location_date
+    ON yellow_taxi_trips(PULocationID, DATE(tpep_pickup_datetime));
+```
+
+```ini
+# sql/flyway.conf
+flyway.url=jdbc:postgresql://localhost:5432/taxi_analytics
+flyway.user=${DB_USER}
+flyway.password=${DB_PASSWORD}
+flyway.locations=filesystem:./migrations
+flyway.baselineOnMigrate=true
+flyway.validateOnMigrate=true
+```
+
+```yaml
+# .pre-commit-config.yaml
+repos:
+  - repo: https://github.com/sqlfluff/sqlfluff
+    rev: 2.3.0
+    hooks:
+      - id: sqlfluff-lint
+        args: [--dialect, postgres]
+        files: \.sql$
+      - id: sqlfluff-fix
+        args: [--dialect, postgres]
+        files: \.sql$
+
+  - repo: local
+    hooks:
+      - id: sql-migration-naming
+        name: Check SQL migration naming
+        entry: bash -c 'for f in sql/migrations/*.sql; do [[ $(basename "$f") =~ ^V[0-9]{3}__[a-z_]+\.sql$ ]] || (echo "Invalid migration name: $f" && exit 1); done'
+        language: system
+        files: sql/migrations/.*\.sql$
+```
+
+```bash
+# Step 2: Initialize Git repository and set up hooks
+git init
+pip install pre-commit sqlfluff
+pre-commit install
+
+# Step 3: Create .sqlfluff configuration
+cat > .sqlfluff << 'EOF'
+[sqlfluff]
+dialect = postgres
+templater = raw
+max_line_length = 120
+
+[sqlfluff:rules]
+comma_style = trailing
+capitalisation_policy = lower
+
+[sqlfluff:rules:L010]
+capitalisation_policy = upper
+
+[sqlfluff:rules:L014]
+extended_capitalisation_policy = lower
+EOF
+
+# Step 4: Run Flyway commands
+flyway info          # Show migration status
+flyway validate      # Validate migrations
+flyway migrate       # Apply pending migrations
+flyway repair        # Repair checksum issues
+
+# Step 5: Create a deployment script
+cat > deploy.sh << 'EOF'
+#!/bin/bash
+set -e
+
+echo "Running SQL linting..."
+sqlfluff lint sql/ --dialect postgres
+
+echo "Validating migrations..."
+flyway validate
+
+echo "Applying migrations..."
+flyway migrate
+
+echo "Running tests..."
+psql -h $DB_HOST -U $DB_USER -d $DB_NAME -f sql/tests/test_functions.sql
+
+echo "Deployment complete!"
+EOF
+chmod +x deploy.sh
+```
+
+```markdown
+<!-- sql/README.md -->
+# Taxi Analytics SQL Scripts
+
+## Directory Structure
+
+- `migrations/` - Versioned schema migrations (Flyway format)
+- `functions/` - Reusable SQL functions
+- `procedures/` - Stored procedures for ETL operations
+- `views/` - Materialized and regular views
+- `tests/` - SQL test scripts
+- `seeds/` - Reference data
+
+## Naming Conventions
+
+- Migrations: `V###__description_in_snake_case.sql`
+- Functions: `function_name.sql`
+- Tests: `test_*.sql`
+
+## Deployment
+
+```bash
+# Lint SQL files
+sqlfluff lint sql/
+
+# Apply migrations
+flyway migrate
+
+# Run tests
+./deploy.sh
+```
+
+## Migration Guidelines
+
+1. Never modify existing migrations
+2. Always add new migrations for schema changes
+3. Test migrations in dev before production
+4. Include rollback instructions in comments
+```
 
 ---
 

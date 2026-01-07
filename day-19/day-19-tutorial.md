@@ -52,7 +52,7 @@ AWS KMS is a managed service that enables you to create and control cryptographi
 %%{init: {'theme':'neutral'}}%%
 flowchart TB
     subgraph KMS["AWS KMS"]
-        CMK["Customer Master Key<br/>(CMK)"]
+        KMSKey["KMS Key"]
         DK["Data Keys"]
         KP["Key Policies"]
     end
@@ -64,11 +64,11 @@ flowchart TB
         Redshift["Redshift"]
     end
     
-    CMK --> DK
-    KP --> CMK
+    KMSKey --> DK
+    KP --> KMSKey
     DK --> Services
     
-    style CMK fill:#74c0fc,color:#000
+    style KMSKey fill:#74c0fc,color:#000
     style DK fill:#51cf66,color:#000
     style KP fill:#ffd43b,color:#000
     style S3 fill:#da77f2,color:#000
@@ -79,20 +79,22 @@ flowchart TB
 
 ### Key Concepts
 
-#### Customer Master Keys (CMKs)
+#### KMS Keys
 
-CMKs are the primary resources in AWS KMS. They can be:
+> **Note:** AWS deprecated the term "Customer Master Key (CMK)" in favor of "KMS key" in 2022. Throughout this tutorial, we use the current terminology "KMS key" to refer to the primary cryptographic keys managed by AWS KMS.
 
-| CMK Type | Description | Use Case |
-|----------|-------------|----------|
+KMS keys are the primary resources in AWS KMS. They can be:
+
+| KMS Key Type | Description | Use Case |
+|--------------|-------------|----------|
 | **AWS Managed** | Created and managed by AWS services | Default encryption for S3, EBS |
 | **Customer Managed** | Created and managed by you | Custom encryption requirements |
 | **AWS Owned** | Owned by AWS, used across accounts | Shared service encryption |
 
-#### Creating a Customer Managed Key
+#### Creating a Customer Managed KMS Key
 
 ```bash
-# Create a symmetric CMK for encrypting taxi data
+# Create a symmetric KMS key for encrypting taxi data
 aws kms create-key \
     --description "NYC Taxi Data Encryption Key" \
     --key-usage ENCRYPT_DECRYPT \
@@ -154,20 +156,20 @@ Key policies are resource-based policies that control access to CMKs:
 
 ### Envelope Encryption
 
-Envelope encryption is a strategy where you encrypt data with a data key, then encrypt the data key with a master key. This approach is more efficient for large datasets.
+Envelope encryption is a strategy where you encrypt data with a data key, then encrypt the data key with a KMS key. This approach is more efficient for large datasets.
 
 ```mermaid
 %%{init: {'theme':'neutral'}}%%
 flowchart LR
     P["Plaintext Data"] -->|"Encrypt with Data Key"| ED["Encrypted Data"]
-    DK["Data Key"] -->|"Encrypt with CMK"| EDK["Encrypted Data Key"]
-    CMK["CMK in KMS"] -->|"Encrypts"| DK
+    DK["Data Key"] -->|"Encrypt with KMS Key"| EDK["Encrypted Data Key"]
+    KMSKey["KMS Key"] -->|"Encrypts"| DK
     
     style P fill:#ff6b6b,color:#000
     style DK fill:#ffd43b,color:#000
     style EDK fill:#51cf66,color:#000
     style ED fill:#51cf66,color:#000
-    style CMK fill:#74c0fc,color:#000
+    style KMSKey fill:#74c0fc,color:#000
 ```
 
 #### Python Implementation of Envelope Encryption
@@ -176,6 +178,8 @@ flowchart LR
 import boto3
 import base64
 from cryptography.fernet import Fernet
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives import hashes
 import json
 
 class TaxiDataEncryption:
@@ -197,11 +201,28 @@ class TaxiDataEncryption:
         )
         return response['Plaintext'], response['CiphertextBlob']
     
+    def _derive_fernet_key(self, plaintext_key: bytes) -> bytes:
+        """
+        Derive a Fernet-compatible key using HKDF.
+        
+        Note: Simple slicing (plaintext_key[:32]) is not cryptographically sound.
+        HKDF provides proper key derivation with domain separation.
+        """
+        hkdf = HKDF(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=None,
+            info=b'taxi-data-encryption'
+        )
+        derived_key = hkdf.derive(plaintext_key)
+        return base64.urlsafe_b64encode(derived_key)
+    
     def encrypt_data(self, data: dict) -> dict:
         """Encrypt taxi trip data using envelope encryption."""
         plaintext_key, encrypted_key = self.generate_data_key()
         
-        fernet_key = base64.urlsafe_b64encode(plaintext_key[:32])
+        # Use proper key derivation instead of simple slicing
+        fernet_key = self._derive_fernet_key(plaintext_key)
         cipher = Fernet(fernet_key)
         
         json_data = json.dumps(data).encode()
@@ -226,7 +247,8 @@ class TaxiDataEncryption:
         )
         
         plaintext_key = response['Plaintext']
-        fernet_key = base64.urlsafe_b64encode(plaintext_key[:32])
+        # Use the same key derivation as encryption
+        fernet_key = self._derive_fernet_key(plaintext_key)
         cipher = Fernet(fernet_key)
         
         encrypted_data = base64.b64decode(encrypted_payload['encrypted_data'])
@@ -1028,6 +1050,10 @@ classification_levels:
     examples:
       - "Driver license numbers"
       - "Payment card data"
+
+# Note: AWS deprecated "CMK" terminology in 2022
+# Use "KMS key" instead of "Customer Master Key (CMK)"
+# required_kms_cmk above refers to customer-managed KMS keys
 ```
 
 ### Data Quality Management
@@ -1431,7 +1457,60 @@ aws s3api put-public-access-block \
         "BlockPublicPolicy": true,
         "RestrictPublicBuckets": true
     }'
+
+# Step 4: Create encrypted RDS instance
+# First, create a DB subnet group (requires existing VPC subnets)
+aws rds create-db-subnet-group \
+    --db-subnet-group-name taxi-db-subnet-group \
+    --db-subnet-group-description "Subnet group for taxi database" \
+    --subnet-ids subnet-xxxxxxxx subnet-yyyyyyyy
+
+# Generate a secure password and store in Secrets Manager
+DB_PASSWORD=$(aws secretsmanager get-random-password \
+    --password-length 32 \
+    --exclude-punctuation \
+    --query RandomPassword \
+    --output text)
+
+aws secretsmanager create-secret \
+    --name "nyc-taxi/rds/master-password" \
+    --secret-string "$DB_PASSWORD"
+
+# Create encrypted RDS PostgreSQL instance
+aws rds create-db-instance \
+    --db-instance-identifier taxi-db-encrypted \
+    --db-instance-class db.t3.micro \
+    --engine postgres \
+    --engine-version 15.4 \
+    --master-username admin \
+    --master-user-password "$DB_PASSWORD" \
+    --allocated-storage 20 \
+    --storage-type gp3 \
+    --storage-encrypted \
+    --kms-key-id alias/taxi-encryption-key \
+    --vpc-security-group-ids sg-xxxxxxxx \
+    --db-subnet-group-name taxi-db-subnet-group \
+    --no-publicly-accessible \
+    --backup-retention-period 7 \
+    --deletion-protection \
+    --tags Key=Project,Value=NYCTaxi Key=Environment,Value=Production
+
+# Wait for RDS instance to be available
+aws rds wait db-instance-available \
+    --db-instance-identifier taxi-db-encrypted
+
+# Verify encryption is enabled
+aws rds describe-db-instances \
+    --db-instance-identifier taxi-db-encrypted \
+    --query 'DBInstances[0].{
+        Identifier: DBInstanceIdentifier,
+        Encrypted: StorageEncrypted,
+        KmsKeyId: KmsKeyId,
+        Status: DBInstanceStatus
+    }'
 ```
+
+> **Important:** RDS encryption must be enabled at instance creation time. You cannot encrypt an existing unencrypted RDS instance directly. To encrypt an existing instance, you must create an encrypted snapshot and restore from it.
 
 ### Lab 2: Configure VPC with Private Subnets
 
@@ -1671,7 +1750,7 @@ if __name__ == "__main__":
 ### Key Takeaways
 
 1. **AWS KMS and Secrets Manager**
-   - Use CMKs for encryption key management
+   - Use KMS keys for encryption key management
    - Implement envelope encryption for large datasets
    - Enable automatic key rotation
    - Store credentials in Secrets Manager with rotation

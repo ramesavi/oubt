@@ -276,13 +276,268 @@ CREATE TABLE dim_vendor_history (
 );
 ```
 
-### SCD Type 5: Type 4 + Type 1 (Mini-Dimension)
+### SCD Type 5: Mini-Dimension with Outrigger
 
-Type 5 combines Type 4 with Type 1 using a mini-dimension for frequently changing attributes.
+Type 5 separates rapidly changing attributes into a "mini-dimension" table, linked to the main dimension via a foreign key. This prevents the main dimension from growing too quickly while still maintaining history.
 
-### SCD Type 6: Type 1 + Type 2 + Type 3 (Hybrid)
+**Use Cases:** Customer demographics that change frequently (age band, income band, loyalty tier), while core customer data (name, address) changes rarely.
 
-Type 6 combines Types 1, 2, and 3 to provide current values, full history, and previous values.
+```sql
+-- Main dimension table (slowly changing attributes)
+CREATE TABLE dim_customer_type5 (
+    customer_sk SERIAL PRIMARY KEY,
+    customer_id INTEGER NOT NULL,
+    customer_name VARCHAR(100),
+    address VARCHAR(200),
+    -- Foreign key to mini-dimension for rapidly changing attributes
+    current_demographics_sk INTEGER,
+    effective_start_date TIMESTAMP DEFAULT NOW(),
+    effective_end_date TIMESTAMP DEFAULT '9999-12-31 23:59:59',
+    is_current BOOLEAN DEFAULT TRUE
+);
+
+-- Mini-dimension for rapidly changing attributes
+CREATE TABLE dim_customer_demographics (
+    demographics_sk SERIAL PRIMARY KEY,
+    age_band VARCHAR(20),      -- e.g., '25-34', '35-44'
+    income_band VARCHAR(20),   -- e.g., 'Low', 'Medium', 'High'
+    loyalty_tier VARCHAR(20)   -- e.g., 'Bronze', 'Silver', 'Gold'
+);
+
+-- Populate mini-dimension with all possible combinations
+INSERT INTO dim_customer_demographics (age_band, income_band, loyalty_tier)
+SELECT age_band, income_band, loyalty_tier
+FROM (VALUES ('18-24'), ('25-34'), ('35-44'), ('45-54'), ('55-64'), ('65+')) AS ages(age_band)
+CROSS JOIN (VALUES ('Low'), ('Medium'), ('High')) AS incomes(income_band)
+CROSS JOIN (VALUES ('Bronze'), ('Silver'), ('Gold'), ('Platinum')) AS tiers(loyalty_tier);
+
+-- Fact table references both dimensions
+CREATE TABLE fact_orders_type5 (
+    order_id SERIAL PRIMARY KEY,
+    customer_sk INTEGER REFERENCES dim_customer_type5(customer_sk),
+    demographics_sk INTEGER REFERENCES dim_customer_demographics(demographics_sk),
+    order_date DATE,
+    order_amount DECIMAL(10,2)
+);
+
+-- Index for efficient lookups
+CREATE INDEX idx_demographics_lookup ON dim_customer_demographics(age_band, income_band, loyalty_tier);
+
+-- Procedure to update customer with Type 5 logic
+CREATE OR REPLACE PROCEDURE scd_type5_customer_update(
+    p_customer_id INTEGER,
+    p_customer_name VARCHAR,
+    p_address VARCHAR,
+    p_age_band VARCHAR,
+    p_income_band VARCHAR,
+    p_loyalty_tier VARCHAR
+)
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_current_record RECORD;
+    v_demographics_sk INTEGER;
+    v_has_main_changes BOOLEAN := FALSE;
+BEGIN
+    -- Find or create demographics record
+    SELECT demographics_sk INTO v_demographics_sk
+    FROM dim_customer_demographics
+    WHERE age_band = p_age_band
+      AND income_band = p_income_band
+      AND loyalty_tier = p_loyalty_tier;
+    
+    IF v_demographics_sk IS NULL THEN
+        INSERT INTO dim_customer_demographics (age_band, income_band, loyalty_tier)
+        VALUES (p_age_band, p_income_band, p_loyalty_tier)
+        RETURNING demographics_sk INTO v_demographics_sk;
+    END IF;
+    
+    -- Get current customer record
+    SELECT * INTO v_current_record
+    FROM dim_customer_type5
+    WHERE customer_id = p_customer_id AND is_current = TRUE;
+    
+    IF NOT FOUND THEN
+        -- New customer
+        INSERT INTO dim_customer_type5 (customer_id, customer_name, address, current_demographics_sk)
+        VALUES (p_customer_id, p_customer_name, p_address, v_demographics_sk);
+        RETURN;
+    END IF;
+    
+    -- Check for main dimension changes (Type 2 for main attributes)
+    IF v_current_record.customer_name != p_customer_name OR
+       v_current_record.address != p_address THEN
+        v_has_main_changes := TRUE;
+    END IF;
+    
+    IF v_has_main_changes THEN
+        -- Expire current record and create new version
+        UPDATE dim_customer_type5
+        SET effective_end_date = NOW(), is_current = FALSE
+        WHERE customer_sk = v_current_record.customer_sk;
+        
+        INSERT INTO dim_customer_type5 (customer_id, customer_name, address, current_demographics_sk)
+        VALUES (p_customer_id, p_customer_name, p_address, v_demographics_sk);
+    ELSE
+        -- Only demographics changed - just update the FK (Type 1)
+        UPDATE dim_customer_type5
+        SET current_demographics_sk = v_demographics_sk
+        WHERE customer_sk = v_current_record.customer_sk;
+    END IF;
+END;
+$$;
+```
+
+**When to use Type 5:**
+- When some attributes change frequently (daily/weekly) while others change rarely
+- When you want to analyze by current demographics without joining to the main dimension
+- When the combination of rapidly changing attributes is finite and predictable
+- Example: Customer loyalty tier changes monthly, but name/address changes rarely
+
+### SCD Type 6: Hybrid (Type 1 + Type 2 + Type 3)
+
+Type 6 combines all three approaches: it tracks full history (Type 2), keeps the previous value (Type 3), and maintains the current value in all rows (Type 1). This is the most comprehensive but also most complex SCD type.
+
+**Use Cases:** When you need both historical accuracy AND easy access to current values, and reports frequently need "as-was" and "as-is" comparisons.
+
+```sql
+CREATE TABLE dim_vendor_type6 (
+    vendor_sk SERIAL PRIMARY KEY,
+    vendor_id INTEGER NOT NULL,
+    
+    -- Type 1: Current value (updated in ALL rows when changed)
+    current_vendor_name VARCHAR(100),
+    current_address VARCHAR(200),
+    
+    -- Type 3: Previous value (one level of history)
+    previous_vendor_name VARCHAR(100),
+    
+    -- Type 2: Historical tracking
+    historical_vendor_name VARCHAR(100),
+    historical_address VARCHAR(200),
+    effective_start_date TIMESTAMP DEFAULT NOW(),
+    effective_end_date TIMESTAMP DEFAULT '9999-12-31 23:59:59',
+    is_current BOOLEAN DEFAULT TRUE,
+    version_number INTEGER DEFAULT 1
+);
+
+-- Indexes for Type 6 queries
+CREATE INDEX idx_vendor_type6_current ON dim_vendor_type6(vendor_id) WHERE is_current = TRUE;
+CREATE INDEX idx_vendor_type6_dates ON dim_vendor_type6(vendor_id, effective_start_date, effective_end_date);
+
+-- Update procedure for Type 6
+CREATE OR REPLACE PROCEDURE scd_type6_vendor_update(
+    p_vendor_id INTEGER,
+    p_vendor_name VARCHAR,
+    p_address VARCHAR
+)
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_current_record RECORD;
+    v_has_changes BOOLEAN := FALSE;
+    v_new_version INTEGER;
+BEGIN
+    -- Get current record
+    SELECT * INTO v_current_record
+    FROM dim_vendor_type6
+    WHERE vendor_id = p_vendor_id AND is_current = TRUE;
+    
+    IF NOT FOUND THEN
+        -- New vendor - insert first record
+        INSERT INTO dim_vendor_type6 (
+            vendor_id,
+            current_vendor_name, current_address,
+            previous_vendor_name,
+            historical_vendor_name, historical_address,
+            version_number
+        ) VALUES (
+            p_vendor_id,
+            p_vendor_name, p_address,
+            NULL,  -- No previous value for new record
+            p_vendor_name, p_address,
+            1
+        );
+        RETURN;
+    END IF;
+    
+    -- Check for changes
+    IF v_current_record.historical_vendor_name != p_vendor_name OR
+       v_current_record.historical_address != p_address THEN
+        v_has_changes := TRUE;
+    END IF;
+    
+    IF v_has_changes THEN
+        v_new_version := v_current_record.version_number + 1;
+        
+        -- Step 1: Expire current record (Type 2)
+        UPDATE dim_vendor_type6
+        SET effective_end_date = NOW(),
+            is_current = FALSE
+        WHERE vendor_sk = v_current_record.vendor_sk;
+        
+        -- Step 2: Insert new record with history
+        INSERT INTO dim_vendor_type6 (
+            vendor_id,
+            current_vendor_name, current_address,           -- Type 1: Current values
+            previous_vendor_name,                            -- Type 3: Previous value
+            historical_vendor_name, historical_address,      -- Type 2: Historical values
+            effective_start_date, is_current, version_number
+        ) VALUES (
+            p_vendor_id,
+            p_vendor_name, p_address,                        -- Type 1: New current values
+            v_current_record.historical_vendor_name,         -- Type 3: Old value becomes previous
+            p_vendor_name, p_address,                        -- Type 2: Historical values
+            NOW(), TRUE, v_new_version
+        );
+        
+        -- Step 3: Update current values in ALL historical rows (Type 1)
+        UPDATE dim_vendor_type6
+        SET current_vendor_name = p_vendor_name,
+            current_address = p_address
+        WHERE vendor_id = p_vendor_id;
+    END IF;
+END;
+$$;
+
+-- Example queries demonstrating Type 6 capabilities
+
+-- Query 1: Get current state (simple - no joins needed)
+SELECT vendor_id, current_vendor_name, current_address
+FROM dim_vendor_type6
+WHERE vendor_id = 1 AND is_current = TRUE;
+
+-- Query 2: Get historical state at a point in time (Type 2)
+SELECT vendor_id, historical_vendor_name, historical_address
+FROM dim_vendor_type6
+WHERE vendor_id = 1
+  AND effective_start_date <= '2025-06-15'
+  AND effective_end_date > '2025-06-15';
+
+-- Query 3: Compare current vs previous (Type 3)
+SELECT vendor_id,
+       current_vendor_name AS current_name,
+       previous_vendor_name AS previous_name,
+       CASE WHEN current_vendor_name != previous_vendor_name
+            THEN 'Changed' ELSE 'Unchanged' END AS status
+FROM dim_vendor_type6
+WHERE is_current = TRUE;
+
+-- Query 4: Full history with current values (all types combined)
+SELECT vendor_id,
+       historical_vendor_name AS name_at_time,
+       current_vendor_name AS current_name,
+       effective_start_date,
+       effective_end_date,
+       version_number
+FROM dim_vendor_type6
+WHERE vendor_id = 1
+ORDER BY version_number;
+```
+
+**When to use Type 6:**
+- When you need both historical accuracy AND easy access to current values
+- When reports frequently need "as-was" and "as-is" comparisons
+- When you need to track the previous value for change detection
+- Trade-off: Most complex to maintain, highest storage requirements
 
 ### SCD Type Comparison Summary
 
@@ -1035,28 +1290,123 @@ df = spark.createDataFrame(initial_data, columns) \
 # Write as Delta table
 df.write.format("delta").mode("overwrite").save("/tmp/delta/dim_taxi_zone")
 
-# SCD Type 2 merge with Delta Lake
+# SCD Type 2 merge with Delta Lake - Atomic Operation
 delta_table = DeltaTable.forPath(spark, "/tmp/delta/dim_taxi_zone")
 
 updates = spark.createDataFrame([
     (132, "Queens", "JFK International Airport", "Airports")
 ], columns)
 
-# Merge logic
-delta_table.alias("target").merge(
-    updates.alias("source"),
-    "target.location_id = source.location_id AND target.is_current = true"
-).whenMatchedUpdate(
-    condition="target.zone_name != source.zone_name",
-    set={"effective_end_date": "current_timestamp()", "is_current": "false"}
-).execute()
-
-# Insert new version
-updates.withColumn("effective_start_date", current_timestamp()) \
+# Prepare the updates with new row data
+updates_with_metadata = updates \
+    .withColumn("effective_start_date", current_timestamp()) \
     .withColumn("effective_end_date", lit("9999-12-31").cast("timestamp")) \
     .withColumn("is_current", lit(True)) \
-    .withColumn("version_number", lit(2)) \
-    .write.format("delta").mode("append").save("/tmp/delta/dim_taxi_zone")
+    .withColumn("mergeKey", col("location_id"))
+
+# Create staged updates: rows to insert (new versions)
+staged_updates = updates_with_metadata.withColumn("mergeKey", lit(None))
+
+# Union: original updates (for matching) + staged updates (for inserting)
+all_updates = updates_with_metadata.union(staged_updates)
+
+# Atomic SCD Type 2 merge - expire old and insert new in single transaction
+delta_table.alias("target").merge(
+    all_updates.alias("source"),
+    "target.location_id = source.mergeKey AND target.is_current = true"
+).whenMatchedUpdate(
+    condition="target.zone_name != source.zone_name OR target.borough != source.borough OR target.service_zone != source.service_zone",
+    set={
+        "effective_end_date": "current_timestamp()",
+        "is_current": "false"
+    }
+).whenNotMatchedInsert(
+    condition="source.mergeKey IS NULL",
+    values={
+        "location_id": "source.location_id",
+        "borough": "source.borough",
+        "zone_name": "source.zone_name",
+        "service_zone": "source.service_zone",
+        "effective_start_date": "source.effective_start_date",
+        "effective_end_date": "source.effective_end_date",
+        "is_current": "source.is_current",
+        "version_number": "2"  # In production, calculate max version + 1
+    }
+).execute()
+
+# Alternative: Complete SCD Type 2 function for production use
+def scd_type2_merge(spark, delta_path, updates_df, key_columns, tracked_columns):
+    """
+    Perform atomic SCD Type 2 merge on a Delta table.
+    
+    Args:
+        spark: SparkSession
+        delta_path: Path to Delta table
+        updates_df: DataFrame with updates
+        key_columns: List of business key columns
+        tracked_columns: List of columns to track for changes
+    """
+    from pyspark.sql.functions import col, lit, current_timestamp, coalesce, max as spark_max
+    
+    delta_table = DeltaTable.forPath(spark, delta_path)
+    
+    # Get current max version for each key
+    current_versions = delta_table.toDF() \
+        .filter(col("is_current") == True) \
+        .select(key_columns + ["version_number"])
+    
+    # Join updates with current versions
+    updates_with_version = updates_df.alias("u").join(
+        current_versions.alias("c"),
+        [col(f"u.{k}") == col(f"c.{k}") for k in key_columns],
+        "left"
+    ).select(
+        *[col(f"u.{c}") for c in updates_df.columns],
+        coalesce(col("c.version_number"), lit(0)).alias("current_version")
+    )
+    
+    # Prepare merge key (null for inserts)
+    key_expr = " AND ".join([f"target.{k} = source.{k}" for k in key_columns])
+    change_condition = " OR ".join([f"target.{c} != source.{c}" for c in tracked_columns])
+    
+    # Staged updates for insert
+    staged = updates_with_version \
+        .withColumn("mergeKey", lit(None)) \
+        .withColumn("effective_start_date", current_timestamp()) \
+        .withColumn("effective_end_date", lit("9999-12-31").cast("timestamp")) \
+        .withColumn("is_current", lit(True)) \
+        .withColumn("version_number", col("current_version") + 1)
+    
+    # Original for matching
+    original = updates_with_version \
+        .withColumn("mergeKey", col(key_columns[0])) \
+        .withColumn("effective_start_date", current_timestamp()) \
+        .withColumn("effective_end_date", lit("9999-12-31").cast("timestamp")) \
+        .withColumn("is_current", lit(True)) \
+        .withColumn("version_number", col("current_version") + 1)
+    
+    all_updates = original.union(staged)
+    
+    # Execute atomic merge
+    delta_table.alias("target").merge(
+        all_updates.alias("source"),
+        f"{key_expr.replace('source.', 'source.mergeKey = target.').split(' AND ')[0]} AND target.is_current = true"
+    ).whenMatchedUpdate(
+        condition=change_condition,
+        set={"effective_end_date": "current_timestamp()", "is_current": "false"}
+    ).whenNotMatchedInsert(
+        condition="source.mergeKey IS NULL",
+        values={c: f"source.{c}" for c in staged.columns if c != "mergeKey" and c != "current_version"}
+    ).execute()
+
+# Usage example
+# scd_type2_merge(
+#     spark,
+#     "/tmp/delta/dim_taxi_zone",
+#     updates,
+#     key_columns=["location_id"],
+#     tracked_columns=["borough", "zone_name", "service_zone"]
+# )
 ```
 
 ### Lab 4: Implement SQL with Version Control

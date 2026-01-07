@@ -301,6 +301,10 @@ CREATE TABLE dim_taxi_zones (
     service_zone VARCHAR(50)
 )
 DISTSTYLE ALL;
+
+-- **Note:** Redshift does not enforce PRIMARY KEY constraints - they are informational
+-- only and used by the query optimizer for better execution plans. You must ensure
+-- uniqueness through your ETL process or use MERGE/UPSERT patterns.
 ```
 
 **When to Use ALL:**
@@ -1500,21 +1504,43 @@ INSERT INTO dim_rate VALUES
 (5, 'Negotiated fare'),
 (6, 'Group ride');
 
--- Populate date dimension
+-- Populate date dimension (Redshift-compatible syntax)
+INSERT INTO dim_datetime
+WITH RECURSIVE date_series AS (
+    -- Base case: start date
+    SELECT '2024-01-01'::DATE AS d
+    UNION ALL
+    -- Recursive case: add one day using DATEADD (Redshift function)
+    SELECT DATEADD(day, 1, d)
+    FROM date_series
+    WHERE d < '2024-12-31'
+)
+SELECT
+    TO_CHAR(d, 'YYYYMMDD')::INTEGER AS date_key,
+    d AS full_date,
+    EXTRACT(YEAR FROM d)::SMALLINT AS year,
+    EXTRACT(MONTH FROM d)::SMALLINT AS month,
+    TO_CHAR(d, 'Month') AS month_name,
+    EXTRACT(DOW FROM d)::SMALLINT AS day_of_week,
+    TO_CHAR(d, 'Day') AS day_name,
+    CASE WHEN EXTRACT(DOW FROM d) IN (0, 6) THEN TRUE ELSE FALSE END AS is_weekend
+FROM date_series;
+
+-- Alternative approach using generate_series (if available in your Redshift version)
+-- Note: generate_series is available in Redshift Serverless and recent provisioned versions
+/*
 INSERT INTO dim_datetime
 SELECT
-    TO_CHAR(d, 'YYYYMMDD')::INTEGER as date_key,
-    d as full_date,
-    EXTRACT(YEAR FROM d) as year,
-    EXTRACT(MONTH FROM d) as month,
-    TO_CHAR(d, 'Month') as month_name,
-    EXTRACT(DOW FROM d) as day_of_week,
-    TO_CHAR(d, 'Day') as day_name,
-    CASE WHEN EXTRACT(DOW FROM d) IN (0, 6) THEN TRUE ELSE FALSE END as is_weekend
-FROM (
-    SELECT '2024-01-01'::DATE + (n || ' days')::INTERVAL as d
-    FROM (SELECT ROW_NUMBER() OVER () - 1 as n FROM stl_scan LIMIT 366) nums
-) dates;
+    TO_CHAR(d::DATE, 'YYYYMMDD')::INTEGER AS date_key,
+    d::DATE AS full_date,
+    EXTRACT(YEAR FROM d)::SMALLINT AS year,
+    EXTRACT(MONTH FROM d)::SMALLINT AS month,
+    TO_CHAR(d::DATE, 'Month') AS month_name,
+    EXTRACT(DOW FROM d)::SMALLINT AS day_of_week,
+    TO_CHAR(d::DATE, 'Day') AS day_name,
+    CASE WHEN EXTRACT(DOW FROM d) IN (0, 6) THEN TRUE ELSE FALSE END AS is_weekend
+FROM generate_series('2024-01-01'::DATE, '2024-12-31'::DATE, '1 day'::INTERVAL) AS d;
+*/
 
 -- Load fact data from Parquet
 COPY fact_taxi_trips (

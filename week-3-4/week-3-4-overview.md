@@ -1,5 +1,9 @@
 # Week 3-4: Orchestration, Transformation, Data Warehousing & Analytics
 
+**Navigation:** [← Week 1-2 Overview](../week-1-2/week-1-2-overview.md) | Week 3-4 Overview
+
+---
+
 ## Table of Contents
 
 1. [Overview](#overview)
@@ -523,13 +527,13 @@ flowchart LR
 | **CloudWatch** | Logs, metrics, alarms, dashboards, Logs Insights |
 | **CloudTrail** | Management events, data events, audit logging |
 | **X-Ray** | Distributed tracing, segments, subsegments |
-| **Data Lineage** | Table-level, column-level, row-level tracking |
+| **Data Lineage Tracking** | Table-level, column-level, row-level tracking with OpenLineage |
 | **OpenLineage** | Standard for lineage metadata |
 | **Five Pillars** | Freshness, volume, schema, distribution, lineage |
 | **Incident Response** | P1-P4 classification, runbooks, post-mortems |
 | **Query Optimization** | EXPLAIN plans, anti-patterns |
 | **Spark Optimization** | Partitioning, broadcast joins, AQE, caching |
-| **Storage Optimization** | File sizing, compaction, tiering |
+| **Storage Optimization** | File sizing, compaction, Z-ordering, tiering |
 
 #### Data Observability Pillars
 
@@ -575,7 +579,7 @@ flowchart TB
 
 | Topic | Description |
 |-------|-------------|
-| **AWS KMS** | CMKs, envelope encryption, key rotation |
+| **AWS KMS** | KMS keys, envelope encryption, key rotation |
 | **Secrets Manager** | Credential storage, automatic rotation |
 | **IAM Policies** | Identity-based, resource-based, permission boundaries |
 | **SCPs** | Organization-level guardrails |
@@ -583,7 +587,7 @@ flowchart TB
 | **Data Masking** | Redaction, tokenization, hashing, pseudonymization |
 | **Governance Framework** | Roles, classification, lifecycle management |
 | **Lake Formation** | Centralized data lake governance |
-| **Multi-Domain MDM** | Hub-and-spoke, federated patterns |
+| **Multi-Domain MDM Patterns** | Hub-and-spoke, federated, cross-domain relationships |
 
 #### Security Architecture
 

@@ -131,6 +131,61 @@ flowchart LR
     style Catalog fill:#868e96,color:#000
 ```
 
+### Athena Engine Versions
+
+Athena offers two engine versions with different underlying technologies. Understanding these versions is important for compatibility and performance optimization.
+
+| Feature | Engine Version 2 | Engine Version 3 |
+|---------|------------------|------------------|
+| **Query Engine** | Presto 0.217 | Trino 388 |
+| **Performance** | Baseline | Up to 2x faster for many queries |
+| **LIMIT Optimization** | No (scans all data) | Yes (in some cases with sorted data) |
+| **New Functions** | Limited | Expanded (200+ new functions) |
+| **MERGE Support** | No | Yes |
+| **Default** | Legacy | Recommended for new workgroups |
+| **Iceberg Support** | Limited | Full support |
+
+**Checking and Changing Engine Version:**
+
+```sql
+-- Check current engine version (run in Athena console)
+-- The engine version is shown in the query results metadata
+
+-- To check via AWS CLI:
+-- aws athena get-work-group --work-group primary
+```
+
+```bash
+# Set engine version for workgroup (via AWS CLI)
+aws athena update-work-group \
+    --work-group primary \
+    --configuration-updates '{
+        "EngineVersion": {
+            "SelectedEngineVersion": "Athena engine version 3"
+        }
+    }'
+
+# Create a new workgroup with Engine Version 3
+aws athena create-work-group \
+    --name "analytics-team" \
+    --configuration '{
+        "ResultConfiguration": {
+            "OutputLocation": "s3://my-athena-results/analytics/"
+        },
+        "EngineVersion": {
+            "SelectedEngineVersion": "Athena engine version 3"
+        }
+    }'
+```
+
+**Engine Version 3 Benefits:**
+
+- **Improved Performance**: Query execution is up to 2x faster for many workloads
+- **MERGE Statement**: Supports MERGE INTO for upsert operations (useful for SCD Type 1)
+- **Better LIMIT Handling**: Can short-circuit queries with LIMIT in some scenarios
+- **Enhanced Functions**: Access to 200+ new SQL functions
+- **Apache Iceberg**: Full support for Iceberg table format
+
 ### Presto/Trino SQL Engine Overview
 
 Athena uses **Trino** (formerly PrestoSQL) as its underlying query engine. Trino is a distributed SQL query engine designed for fast analytic queries against data sources of all sizes.
@@ -1063,6 +1118,75 @@ SELECT
     YEAR(pickup_datetime) as year,
     MONTH(pickup_datetime) as month
 FROM nyc_taxi.yellow_trips_csv;
+```
+
+### Implementing SCD Type 2 with Athena
+
+While Athena is primarily for querying, you can implement SCD Type 2 patterns using CTAS and UNION operations. For a comprehensive guide on SCD implementations, see [Day 14-15: SCD Deep Dive & Master Data Versioning](../day-14-15/day-14-15-tutorial.md).
+
+**SCD Type 2 Pattern with Athena CTAS:**
+
+```sql
+-- Step 1: Create a staging table with new/updated records
+CREATE TABLE nyc_taxi.dim_zones_staging
+WITH (format = 'PARQUET', external_location = 's3://bucket/staging/zones/')
+AS SELECT * FROM nyc_taxi.source_zones;
+
+-- Step 2: Expire existing records that have changes
+CREATE TABLE nyc_taxi.dim_zones_expired
+WITH (format = 'PARQUET', external_location = 's3://bucket/temp/zones_expired/')
+AS
+SELECT
+    d.zone_sk,
+    d.location_id,
+    d.borough,
+    d.zone_name,
+    d.service_zone,
+    d.effective_start_date,
+    CASE
+        WHEN s.location_id IS NOT NULL
+             AND (d.borough != s.borough OR d.zone_name != s.zone_name)
+        THEN CURRENT_TIMESTAMP
+        ELSE d.effective_end_date
+    END AS effective_end_date,
+    CASE
+        WHEN s.location_id IS NOT NULL
+             AND (d.borough != s.borough OR d.zone_name != s.zone_name)
+        THEN FALSE
+        ELSE d.is_current
+    END AS is_current
+FROM nyc_taxi.dim_zones d
+LEFT JOIN nyc_taxi.dim_zones_staging s
+    ON d.location_id = s.location_id AND d.is_current = TRUE;
+
+-- Step 3: Insert new versions for changed records
+CREATE TABLE nyc_taxi.dim_zones_new_versions
+WITH (format = 'PARQUET', external_location = 's3://bucket/temp/zones_new/')
+AS
+SELECT
+    ROW_NUMBER() OVER () + (SELECT MAX(zone_sk) FROM nyc_taxi.dim_zones) AS zone_sk,
+    s.location_id,
+    s.borough,
+    s.zone_name,
+    s.service_zone,
+    CURRENT_TIMESTAMP AS effective_start_date,
+    TIMESTAMP '9999-12-31 23:59:59' AS effective_end_date,
+    TRUE AS is_current
+FROM nyc_taxi.dim_zones_staging s
+JOIN nyc_taxi.dim_zones d
+    ON s.location_id = d.location_id AND d.is_current = TRUE
+WHERE s.borough != d.borough OR s.zone_name != d.zone_name;
+
+-- Step 4: Combine expired records with new versions
+CREATE TABLE nyc_taxi.dim_zones_updated
+WITH (format = 'PARQUET', external_location = 's3://bucket/processed/zones/')
+AS
+SELECT * FROM nyc_taxi.dim_zones_expired
+UNION ALL
+SELECT * FROM nyc_taxi.dim_zones_new_versions;
+
+-- Note: For production SCD Type 2, consider using AWS Glue or Spark
+-- which provide better support for MERGE operations
 ```
 
 ---
