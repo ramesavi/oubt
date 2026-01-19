@@ -1,1 +1,0 @@
-CREATE DATABASE master LOCATION 's3://week-4-oubt/master';
