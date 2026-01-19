@@ -22,6 +22,7 @@ aws glue create-job \
     "--job-language": "python",
     "--datalake-formats": "delta",
     "--extra-py-files": "s3://week-4-oubt/code/glue/libs/glue_utils.zip",
+    "--additional-python-modules": "recordlinkage",
     "--bronze_db": "bronze",
     "--master_db": "master",
     "--debug_db": "debug",

@@ -426,18 +426,18 @@ def write_debug_vendor_match_pairs(df, spark, table, path):
     )
     (
         df.select(
-            "source_id_1",
-            "source_id_2",
-            "entity_type_1",
-            "entity_type_2",
-            "normalized_name_1",
-            "normalized_name_2",
-            "match_confidence",
-            "match_group_1",
-            "match_group_2",
-            "same_group",
-            "above_threshold",
-            "ingestion_date",
+            F.col("source_id_1").cast("long"),
+            F.col("source_id_2").cast("long"),
+            F.col("entity_type_1").cast("string"),
+            F.col("entity_type_2").cast("string"),
+            F.col("normalized_name_1").cast("string"),
+            F.col("normalized_name_2").cast("string"),
+            F.col("match_confidence").cast("double"),
+            F.col("match_group_1").cast("long"),
+            F.col("match_group_2").cast("long"),
+            F.col("same_group").cast("boolean"),
+            F.col("above_threshold").cast("boolean"),
+            F.col("ingestion_date").cast("date"),
         )
         .write.format("delta")
         .mode("overwrite")
@@ -522,15 +522,19 @@ def apply_scd_type_2(new_dim, existing_dim, ingestion_date):
     joined = new_dim_base.alias("n").join(
         existing_current.alias("e"), "vendor_gk", "left"
     )
+
+    # Records that exist in both and haven't changed - keep existing
     unchanged = joined.filter(
         F.col("e.vendor_gk").isNotNull()
         & (F.col("n.record_hash") == F.col("e.record_hash"))
     ).select("e.*")
 
+    # Records that exist in both but have changed
     changed = joined.filter(
         F.col("e.vendor_gk").isNotNull()
         & (F.col("n.record_hash") != F.col("e.record_hash"))
     )
+    # Close old records
     closed = (
         changed.select("e.*")
         .withColumn("valid_to", F.date_sub(F.lit(ingestion_date).cast("date"), 1))
@@ -545,13 +549,20 @@ def apply_scd_type_2(new_dim, existing_dim, ingestion_date):
         .withColumn("valid_from", F.lit(ingestion_date).cast("date"))
     )
 
+    # New vendor_gk not in existing
     new_only = joined.filter(F.col("e.vendor_gk").isNull()).select("n.*")
+
+    # Existing current records NOT in new data - keep them as-is (still current)
+    not_in_new = existing_current.join(
+        new_dim.select("vendor_gk"), "vendor_gk", "left_anti"
+    )
 
     return (
         existing_hist.unionByName(unchanged)
         .unionByName(closed)
         .unionByName(changed_new)
         .unionByName(new_only)
+        .unionByName(not_in_new)
     )
 
 
@@ -576,6 +587,8 @@ def apply_xref_scd2(new_xref, existing_xref, ingestion_date):
     existing_hist = existing_xref.filter(F.col("is_current") == F.lit(False))
 
     joined = new_xref.alias("n").join(existing_current.alias("e"), "vendor_id", "left")
+
+    # Records that exist in both and haven't changed - keep existing
     unchanged = joined.filter(
         F.col("e.vendor_id").isNotNull()
         & (F.col("e.vendor_gk") == F.col("n.vendor_gk"))
@@ -584,6 +597,7 @@ def apply_xref_scd2(new_xref, existing_xref, ingestion_date):
         & (F.col("e.decision") == F.col("n.decision"))
     ).select("e.*")
 
+    # Records that exist in both but have changed
     changed = joined.filter(
         F.col("e.vendor_id").isNotNull()
         & ~(
@@ -593,6 +607,7 @@ def apply_xref_scd2(new_xref, existing_xref, ingestion_date):
             & (F.col("e.decision") == F.col("n.decision"))
         )
     )
+    # Close old records - valid_to is day before new record starts
     closed = (
         changed.select("e.*")
         .withColumn("valid_to", F.date_sub(F.lit(ingestion_date).cast("date"), 1))
@@ -600,13 +615,20 @@ def apply_xref_scd2(new_xref, existing_xref, ingestion_date):
     )
     changed_new = changed.select("n.*")
 
+    # New vendor_ids not in existing
     new_only = joined.filter(F.col("e.vendor_id").isNull()).select("n.*")
+
+    # Existing current records NOT in new data - keep them as-is (still current)
+    not_in_new = existing_current.join(
+        new_xref.select("vendor_id"), "vendor_id", "left_anti"
+    )
 
     return (
         existing_hist.unionByName(unchanged)
         .unionByName(closed)
         .unionByName(changed_new)
         .unionByName(new_only)
+        .unionByName(not_in_new)
     )
 
 
