@@ -448,3 +448,110 @@ class TestXrefSCD2:
         assert current[0]["vendor_gk"] == 1
         assert len(closed) == 1
         assert closed[0]["vendor_gk"] == 99
+
+    def test_xref_scd2_existing_not_in_new_stays_current(self, spark):
+        """Existing records NOT in new data should remain current (incremental processing)."""
+        from datetime import date
+
+        schema = self._xref_schema()
+        # Day 1: vendor_ids 1, 2, 6, 7 were created
+        existing_xref = spark.createDataFrame(
+            [
+                (1, 100, date(2026, 1, 18), None, True, "RECORDLINKAGE", 0.0, "NO_MATCH"),
+                (2, 200, date(2026, 1, 18), None, True, "RECORDLINKAGE", 0.65, "NO_MATCH"),
+                (6, 600, date(2026, 1, 18), None, True, "RECORDLINKAGE", 0.48, "NO_MATCH"),
+                (7, 700, date(2026, 1, 18), None, True, "EXACT", 1.0, "AUTO"),
+            ],
+            schema,
+        )
+        # Day 2: only vendor_ids 7, 8, 10 are in the new data
+        new_xref = spark.createDataFrame(
+            [
+                (7, 700, date(2026, 1, 19), None, True, "EXACT", 1.0, "AUTO"),
+                (8, 100, date(2026, 1, 19), None, True, "RECORDLINKAGE", 0.98, "AUTO"),
+                (10, 1000, date(2026, 1, 19), None, True, "RECORDLINKAGE", 0.53, "NO_MATCH"),
+            ],
+            schema,
+        )
+        result = apply_xref_scd2(new_xref, existing_xref, ingestion_date="2026-01-19")
+        records = result.collect()
+
+        current = [r for r in records if r["is_current"]]
+        current_vendor_ids = {r["vendor_id"] for r in current}
+
+        # All vendor_ids should still be current (1, 2, 6, 7, 8, 10)
+        assert current_vendor_ids == {1, 2, 6, 7, 8, 10}, f"Expected all vendors current, got {current_vendor_ids}"
+
+        # vendor_ids 1, 2, 6 should retain their original valid_from date
+        vendor_1 = [r for r in current if r["vendor_id"] == 1][0]
+        assert vendor_1["valid_from"] == date(2026, 1, 18), "vendor_id 1 should keep original valid_from"
+        assert vendor_1["is_current"] is True, "vendor_id 1 should still be current"
+
+        # No records should be closed (vendor_id 7 unchanged, 1, 2, 6 not in new data)
+        closed = [r for r in records if not r["is_current"]]
+        assert len(closed) == 0, f"No records should be closed, got {len(closed)}"
+
+
+class TestSCDType2NotInNew:
+    """Tests for SCD Type 2 when existing records are not in new data."""
+
+    def _dim_schema(self):
+        """Return the schema for dim_vendor DataFrame with None values."""
+        from pyspark.sql.types import (
+            BooleanType,
+            DateType,
+            LongType,
+            StringType,
+            StructField,
+            StructType,
+        )
+
+        return StructType(
+            [
+                StructField("vendor_gk", LongType(), False),
+                StructField("canonical_name", StringType(), True),
+                StructField("valid_from", DateType(), True),
+                StructField("valid_to", DateType(), True),
+                StructField("is_current", BooleanType(), True),
+                StructField("change_reason", StringType(), True),
+                StructField("record_hash", StringType(), True),
+            ]
+        )
+
+    def test_scd2_existing_not_in_new_stays_current(self, spark):
+        """Existing dim records NOT in new data should remain current."""
+        from datetime import date
+
+        schema = self._dim_schema()
+        # Day 1: 4 masters were created
+        existing_dim = spark.createDataFrame(
+            [
+                (1, "Creative Mobile Technologies, LLC", date(2026, 1, 18), None, True, "NEW", "hash1"),
+                (2, "Curb Mobility, LLC", date(2026, 1, 18), None, True, "NEW", "hash2"),
+                (6, "Myle Technologies Inc", date(2026, 1, 18), None, True, "NEW", "hash6"),
+                (7, "Helix", date(2026, 1, 18), None, True, "NEW", "hash7"),
+            ],
+            schema,
+        )
+        # Day 2: only vendor_gk 7 and new 10 are in the new data
+        new_dim = spark.createDataFrame(
+            [
+                (7, "Helix", "hash7", 7),
+                (10, "Savitha Technologies", "hash10", -10),
+            ],
+            ["vendor_gk", "canonical_name", "record_hash", "match_group"],
+        )
+        result = apply_scd_type_2(new_dim, existing_dim, ingestion_date="2026-01-19")
+        records = result.collect()
+
+        current = [r for r in records if r["is_current"]]
+        current_gks = {r["vendor_gk"] for r in current}
+
+        # All vendor_gks should still be current (1, 2, 6, 7, 10)
+        assert current_gks == {1, 2, 6, 7, 10}, f"Expected all masters current, got {current_gks}"
+
+        # vendor_gks 1, 2, 6 should retain their original valid_from date
+        vendor_1 = [r for r in current if r["vendor_gk"] == 1][0]
+        assert vendor_1["valid_from"] == date(2026, 1, 18), "vendor_gk 1 should keep original valid_from"
+        assert vendor_1["is_current"] is True, "vendor_gk 1 should still be current"
+
