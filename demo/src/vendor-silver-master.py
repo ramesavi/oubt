@@ -11,7 +11,7 @@ from pyspark.sql.window import Window
 def get_glue_args_master(argv):
     return getResolvedOptions(
         argv,
-        ["JOB_NAME", "silver_db", "master_db", "ingestion_date"],
+        ["JOB_NAME", "silver_db", "master_db", "ingestion_date", "output_path"],
     )
 
 
@@ -21,7 +21,18 @@ def parse_args(argv):
     master_dim_table = f"{args['master_db']}.dim_vendor"
     master_xref_table = f"{args['master_db']}.xref_vendor"
     ingestion_date = args["ingestion_date"]
-    return args, silver_table, master_dim_table, master_xref_table, ingestion_date
+    output_path = args["output_path"]
+    dim_vendor_path = f"{output_path}/dim_vendor"
+    xref_vendor_path = f"{output_path}/xref_vendor"
+    return (
+        args,
+        silver_table,
+        master_dim_table,
+        master_xref_table,
+        ingestion_date,
+        dim_vendor_path,
+        xref_vendor_path,
+    )
 
 
 def init_spark(args):
@@ -378,14 +389,88 @@ def apply_xref_scd2(new_xref, existing_xref, ingestion_date):
     )
 
 
-def write_master_table(df, table, spark):
-    df.write.format("delta").mode("overwrite").saveAsTable(table)
+def write_dim_vendor(df, spark, table, path):
+    """
+    Create dim_vendor table if missing and overwrite the data.
+    """
+    spark.sql(
+        f"""
+        CREATE TABLE IF NOT EXISTS {table} (
+            vendor_gk LONG,
+            canonical_name STRING,
+            valid_from DATE,
+            valid_to DATE,
+            is_current BOOLEAN,
+            change_reason STRING,
+            record_hash STRING
+        )
+        USING DELTA
+        LOCATION '{path}'
+        """
+    )
+    (
+        df.select(
+            "vendor_gk",
+            "canonical_name",
+            "valid_from",
+            "valid_to",
+            "is_current",
+            "change_reason",
+            "record_hash",
+        )
+        .write.format("delta")
+        .mode("overwrite")
+        .insertInto(table)
+    )
+
+
+def write_xref_vendor(df, spark, table, path):
+    """
+    Create xref_vendor table if missing and overwrite the data.
+    """
+    spark.sql(
+        f"""
+        CREATE TABLE IF NOT EXISTS {table} (
+            vendor_id INT,
+            vendor_gk LONG,
+            valid_from DATE,
+            valid_to DATE,
+            is_current BOOLEAN,
+            match_rule STRING,
+            match_confidence DOUBLE,
+            decision STRING
+        )
+        USING DELTA
+        LOCATION '{path}'
+        """
+    )
+    (
+        df.select(
+            "vendor_id",
+            "vendor_gk",
+            "valid_from",
+            "valid_to",
+            "is_current",
+            "match_rule",
+            "match_confidence",
+            "decision",
+        )
+        .write.format("delta")
+        .mode("overwrite")
+        .insertInto(table)
+    )
 
 
 def main():
-    args, silver_table, master_dim_table, master_xref_table, ingestion_date = parse_args(
-        sys.argv
-    )
+    (
+        args,
+        silver_table,
+        master_dim_table,
+        master_xref_table,
+        ingestion_date,
+        dim_vendor_path,
+        xref_vendor_path,
+    ) = parse_args(sys.argv)
     spark, glue_context, job = init_spark(args)
 
     silver_df = read_silver(spark, silver_table, ingestion_date)
@@ -441,8 +526,8 @@ def main():
     )
     final_xref_vendor = apply_xref_scd2(new_xref, existing_xref, ingestion_date)
 
-    write_master_table(final_dim_vendor, master_dim_table, spark)
-    write_master_table(final_xref_vendor, master_xref_table, spark)
+    write_dim_vendor(final_dim_vendor, spark, master_dim_table, dim_vendor_path)
+    write_xref_vendor(final_xref_vendor, spark, master_xref_table, xref_vendor_path)
 
     job.commit()
 
