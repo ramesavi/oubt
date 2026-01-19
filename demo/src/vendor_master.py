@@ -18,6 +18,7 @@ def get_glue_args(argv):
             "debug_db",
             "ingestion_date",
             "output_path",
+            "debug_output_path",
         ],
     )
 
@@ -30,9 +31,10 @@ def parse_args(argv):
     debug_vendor_match_pairs_table = f"{args['debug_db']}.debug_vendor_match_pairs"
     ingestion_date = args["ingestion_date"]
     output_path = args["output_path"]
+    debug_output_path = args["debug_output_path"]
     dim_vendor_path = f"{output_path}/dim_vendor"
     xref_vendor_path = f"{output_path}/xref_vendor"
-    debug_vendor_match_pairs_path = f"{output_path}/debug_vendor_match_pairs"
+    debug_vendor_match_pairs_path = f"{debug_output_path}/debug_vendor_match_pairs"
     return (
         args,
         bronze_table,
