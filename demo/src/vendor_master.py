@@ -8,16 +8,23 @@ from pyspark.sql import functions as F
 from pyspark.sql.window import Window
 
 
-def get_glue_args_master(argv):
+def get_glue_args(argv):
     return getResolvedOptions(
         argv,
-        ["JOB_NAME", "silver_db", "master_db", "ingestion_date", "output_path", "debug_db"],
+        [
+            "JOB_NAME",
+            "bronze_db",
+            "master_db",
+            "debug_db",
+            "ingestion_date",
+            "output_path",
+        ],
     )
 
 
 def parse_args(argv):
-    args = get_glue_args_master(argv)
-    silver_table = f"{args['silver_db']}.vendor"
+    args = get_glue_args(argv)
+    bronze_table = f"{args['bronze_db']}.vendor"
     master_dim_table = f"{args['master_db']}.dim_vendor"
     master_xref_table = f"{args['master_db']}.xref_vendor"
     debug_vendor_match_pairs_table = f"{args['debug_db']}.debug_vendor_match_pairs"
@@ -28,7 +35,7 @@ def parse_args(argv):
     debug_vendor_match_pairs_path = f"{output_path}/debug_vendor_match_pairs"
     return (
         args,
-        silver_table,
+        bronze_table,
         master_dim_table,
         master_xref_table,
         debug_vendor_match_pairs_table,
@@ -46,25 +53,66 @@ def init_spark(args):
     return spark, glue_context, job
 
 
-def read_silver(spark, silver_table, ingestion_date):
-    return spark.read.table(silver_table).filter(
-        F.col("ingestion_date") == F.lit(ingestion_date).cast("date")
+def read_bronze(glue_context, bronze_table, ingestion_date):
+    """
+    Read from Glue Data Catalog, filtering by ingestion_date.
+    """
+    if "." not in bronze_table:
+        raise ValueError(f"Expected database.table format, got: {bronze_table}")
+    bronze_db, bronze_name = bronze_table.split(".", 1)
+
+    df = (
+        glue_context.create_dynamic_frame.from_catalog(
+            database=bronze_db, table_name=bronze_name
+        )
+        .toDF()
     )
+    return df.filter(F.col("ingestion_date") == F.lit(ingestion_date))
 
 
 def normalized_vendor_name(col: F.Column) -> F.Column:
+    """
+    Normalize vendor name:
+      - lowercase, trim
+      - replace punctuation with spaces
+      - collapse whitespace
+      - remove legal suffixes (LLC, Inc, Ltd, Corp, etc.)
+      - remove common business words that cause false matches
+    """
     x = F.lower(F.trim(col))
     x = F.regexp_replace(x, r"[^a-z0-9]+", " ")
     x = F.regexp_replace(x, r"\s+", " ")
     x = F.trim(x)
+    # Remove legal suffixes
     x = F.regexp_replace(
         x,
         r"\b(llc|l\.l\.c|inc|incorporated|ltd|limited|corp|corporation|co|company)\b",
         "",
     )
+    # Remove common business words that cause false matches
+    x = F.regexp_replace(
+        x,
+        r"\b(technologies|technology|tech|solutions|services|systems|group|holdings|enterprises)\b",
+        "",
+    )
     x = F.regexp_replace(x, r"\s+", " ")
     x = F.trim(x)
     return x
+
+
+def transform_bronze(df):
+    """
+    Transform bronze data: type casting, null handling, normalization, deduplication.
+    """
+    df = df.select(
+        F.col("vendor_id").cast("int").alias("vendor_id"),
+        F.when(F.trim(F.col("vendor_name")) == "", F.lit(None))
+        .otherwise(F.trim(F.col("vendor_name")))
+        .alias("vendor_name"),
+        F.col("ingestion_date").cast("date").alias("ingestion_date"),
+    )
+    df = df.withColumn("normalized_name", normalized_vendor_name(F.col("vendor_name")))
+    return df.dropDuplicates(["vendor_id"])
 
 
 def generate_record_hash(df):
@@ -73,9 +121,9 @@ def generate_record_hash(df):
     )
 
 
-def build_recordlinkage_metrics(silver_df, existing_current, ingestion_date=None):
+def build_recordlinkage_metrics(vendor_df, existing_current, ingestion_date=None):
     pdf_all = (
-        silver_df.select("vendor_id", "vendor_name", "normalized_name", "record_hash")
+        vendor_df.select("vendor_id", "vendor_name", "normalized_name", "record_hash")
         .dropna(subset=["vendor_id"])
         .toPandas()
     )
@@ -140,7 +188,7 @@ def build_recordlinkage_metrics(silver_df, existing_current, ingestion_date=None
     )
 
     all_ids = pdf_all["vendor_id"].astype(int).tolist()
-    silver_entities = pdf_all[["vendor_id", "entity_id"]].copy()
+    vendor_entities = pdf_all[["vendor_id", "entity_id"]].copy()
 
     matchable = combined.dropna(subset=["normalized_name"]).set_index("entity_id")
     if matchable.empty:
@@ -198,7 +246,7 @@ def build_recordlinkage_metrics(silver_df, existing_current, ingestion_date=None
     entity_to_root = {eid: find(eid) for eid in parent}
 
     root_to_gk = {}
-    root_to_min_silver = {}
+    root_to_min_vendor = {}
     matchable_reset = matchable.reset_index()
     for row in matchable_reset.itertuples(index=False):
         entity_id = row.entity_id
@@ -208,10 +256,10 @@ def build_recordlinkage_metrics(silver_df, existing_current, ingestion_date=None
             root_to_gk[root] = min(gk, root_to_gk.get(root, gk))
         else:
             vid = int(row.vendor_id)
-            root_to_min_silver[root] = min(vid, root_to_min_silver.get(root, vid))
+            root_to_min_vendor[root] = min(vid, root_to_min_vendor.get(root, vid))
 
     root_to_group = {}
-    for root, min_vid in root_to_min_silver.items():
+    for root, min_vid in root_to_min_vendor.items():
         if root in root_to_gk:
             root_to_group[root] = root_to_gk[root]
         else:
@@ -223,12 +271,12 @@ def build_recordlinkage_metrics(silver_df, existing_current, ingestion_date=None
             return root_to_group.get(root, -int(vendor_id))
         return -int(vendor_id)
 
-    groups_df = silver_entities.copy()
+    groups_df = vendor_entities.copy()
     groups_df["match_group"] = groups_df.apply(
         lambda row: group_id_for_entity(row["entity_id"], row["vendor_id"]), axis=1
     )
 
-    best = pd.Series(0.0, index=silver_entities["entity_id"].tolist())
+    best = pd.Series(0.0, index=vendor_entities["entity_id"].tolist())
     if not pairs_df.empty:
         pairs_for_best = pairs_df[
             pairs_df["entity_id_1"].str.startswith("S:")
@@ -237,7 +285,7 @@ def build_recordlinkage_metrics(silver_df, existing_current, ingestion_date=None
         best_left = pairs_for_best.groupby("entity_id_1")["match_confidence"].max()
         best_right = pairs_for_best.groupby("entity_id_2")["match_confidence"].max()
         best = best_left.combine(best_right, max).reindex(
-            silver_entities["entity_id"].tolist(), fill_value=0.0
+            vendor_entities["entity_id"].tolist(), fill_value=0.0
         )
 
     metrics_df = groups_df.assign(
@@ -635,7 +683,7 @@ def write_xref_vendor(df, spark, table, path):
 def main():
     (
         args,
-        silver_table,
+        bronze_table,
         master_dim_table,
         master_xref_table,
         debug_vendor_match_pairs_table,
@@ -646,12 +694,15 @@ def main():
     ) = parse_args(sys.argv)
     spark, glue_context, job = init_spark(args)
 
-    silver_df = read_silver(spark, silver_table, ingestion_date)
-    if silver_df.limit(1).count() == 0:
+    # Read from bronze and transform
+    bronze_df = read_bronze(glue_context, bronze_table, ingestion_date)
+    vendor_df = transform_bronze(bronze_df)
+
+    if vendor_df.limit(1).count() == 0:
         job.commit()
         return
 
-    silver_df = generate_record_hash(silver_df)
+    vendor_df = generate_record_hash(vendor_df)
 
     existing_dim = (
         spark.read.table(master_dim_table)
@@ -669,7 +720,7 @@ def main():
         )
 
     metrics_df, debug_pairs_df = build_recordlinkage_metrics(
-        silver_df, existing_current, ingestion_date
+        vendor_df, existing_current, ingestion_date
     )
     metrics_sdf = spark.createDataFrame(metrics_df).select(
         F.col("vendor_id").cast("int"),
@@ -678,8 +729,8 @@ def main():
         F.col("match_rule").cast("string"),
     )
 
-    silver_scored = silver_df.join(metrics_sdf, on="vendor_id", how="left")
-    silver_scored = silver_scored.withColumn(
+    vendor_scored = vendor_df.join(metrics_sdf, on="vendor_id", how="left")
+    vendor_scored = vendor_scored.withColumn(
         "decision",
         F.when(F.col("match_confidence") > 0.95, F.lit("AUTO"))
         .when(F.col("match_confidence") >= 0.85, F.lit("STEWARD_REVIEW"))
@@ -687,13 +738,13 @@ def main():
         .otherwise(F.lit("NO_MATCH")),
     )
 
-    master_candidates = apply_survivorship_rules(silver_scored)
+    master_candidates = apply_survivorship_rules(vendor_scored)
     master_records = build_master_records(master_candidates, existing_current)
 
     final_dim_vendor = apply_scd_type_2(master_records, existing_dim, ingestion_date)
 
     group_to_gk = master_records.select("match_group", "vendor_gk")
-    new_xref = build_xref(silver_scored, group_to_gk, ingestion_date)
+    new_xref = build_xref(vendor_scored, group_to_gk, ingestion_date)
     existing_xref = (
         spark.read.table(master_xref_table)
         if spark.catalog.tableExists(master_xref_table)
