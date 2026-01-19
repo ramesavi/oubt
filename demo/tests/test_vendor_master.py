@@ -417,7 +417,6 @@ class TestXrefSCD2:
         from pyspark.sql.types import (
             BooleanType,
             DateType,
-            DoubleType,
             IntegerType,
             LongType,
             StringType,
@@ -432,8 +431,6 @@ class TestXrefSCD2:
                 StructField("valid_from", DateType(), True),
                 StructField("valid_to", DateType(), True),
                 StructField("is_current", BooleanType(), True),
-                StructField("match_rule", StringType(), True),
-                StructField("match_confidence", DoubleType(), True),
                 StructField("decision", StringType(), True),
             ]
         )
@@ -444,7 +441,7 @@ class TestXrefSCD2:
 
         schema = self._xref_schema()
         new_xref = spark.createDataFrame(
-            [(100, 1, date(2026, 1, 18), None, True, "EXACT", 1.0, "AUTO")],
+            [(100, 1, date(2026, 1, 18), None, True, "AUTO")],
             schema,
         )
         result = apply_xref_scd2(new_xref, existing_xref=None, ingestion_date="2026-01-18")
@@ -459,11 +456,11 @@ class TestXrefSCD2:
 
         schema = self._xref_schema()
         existing_xref = spark.createDataFrame(
-            [(8, 99, date(2026, 1, 18), None, True, "RECORDLINKAGE", 0.8, "MANUAL_REVIEW")],
+            [(8, 99, date(2026, 1, 18), None, True, "MANUAL_REVIEW")],
             schema,
         )
         new_xref = spark.createDataFrame(
-            [(8, 1, date(2026, 1, 19), None, True, "RECORDLINKAGE", 0.85, "STEWARD_REVIEW")],
+            [(8, 1, date(2026, 1, 19), None, True, "STEWARD_REVIEW")],
             schema,
         )
         result = apply_xref_scd2(new_xref, existing_xref, ingestion_date="2026-01-19")
@@ -485,19 +482,19 @@ class TestXrefSCD2:
         # Day 1: vendor_ids 1, 2, 6, 7 were created
         existing_xref = spark.createDataFrame(
             [
-                (1, 100, date(2026, 1, 18), None, True, "RECORDLINKAGE", 0.0, "NO_MATCH"),
-                (2, 200, date(2026, 1, 18), None, True, "RECORDLINKAGE", 0.65, "NO_MATCH"),
-                (6, 600, date(2026, 1, 18), None, True, "RECORDLINKAGE", 0.48, "NO_MATCH"),
-                (7, 700, date(2026, 1, 18), None, True, "EXACT", 1.0, "AUTO"),
+                (1, 100, date(2026, 1, 18), None, True, "NO_MATCH"),
+                (2, 200, date(2026, 1, 18), None, True, "NO_MATCH"),
+                (6, 600, date(2026, 1, 18), None, True, "NO_MATCH"),
+                (7, 700, date(2026, 1, 18), None, True, "AUTO"),
             ],
             schema,
         )
         # Day 2: only vendor_ids 7, 8, 10 are in the new data
         new_xref = spark.createDataFrame(
             [
-                (7, 700, date(2026, 1, 19), None, True, "EXACT", 1.0, "AUTO"),
-                (8, 100, date(2026, 1, 19), None, True, "RECORDLINKAGE", 0.98, "AUTO"),
-                (10, 1000, date(2026, 1, 19), None, True, "RECORDLINKAGE", 0.53, "NO_MATCH"),
+                (7, 700, date(2026, 1, 19), None, True, "AUTO"),
+                (8, 100, date(2026, 1, 19), None, True, "AUTO"),
+                (10, 1000, date(2026, 1, 19), None, True, "NO_MATCH"),
             ],
             schema,
         )
@@ -518,6 +515,32 @@ class TestXrefSCD2:
         # No records should be closed (vendor_id 7 unchanged, 1, 2, 6 not in new data)
         closed = [r for r in records if not r["is_current"]]
         assert len(closed) == 0, f"No records should be closed, got {len(closed)}"
+
+    def test_xref_scd2_decision_change_triggers_scd2(self, spark):
+        """SCD2 should trigger when decision changes (even with same vendor_gk)."""
+        from datetime import date
+
+        schema = self._xref_schema()
+        existing_xref = spark.createDataFrame(
+            [(7, 700, date(2026, 1, 18), None, True, "NO_MATCH")],
+            schema,
+        )
+        # Same vendor_gk but different decision
+        new_xref = spark.createDataFrame(
+            [(7, 700, date(2026, 1, 19), None, True, "AUTO")],
+            schema,
+        )
+        result = apply_xref_scd2(new_xref, existing_xref, ingestion_date="2026-01-19")
+        records = result.collect()
+
+        # Should be 2 records (old closed, new current)
+        assert len(records) == 2, f"Expected 2 records, got {len(records)}"
+        current = [r for r in records if r["is_current"]]
+        closed = [r for r in records if not r["is_current"]]
+        assert len(current) == 1
+        assert current[0]["decision"] == "AUTO"
+        assert len(closed) == 1
+        assert closed[0]["decision"] == "NO_MATCH"
 
 
 class TestSCDType2NotInNew:

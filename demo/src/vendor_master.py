@@ -63,12 +63,9 @@ def read_bronze(glue_context, bronze_table, ingestion_date):
         raise ValueError(f"Expected database.table format, got: {bronze_table}")
     bronze_db, bronze_name = bronze_table.split(".", 1)
 
-    df = (
-        glue_context.create_dynamic_frame.from_catalog(
-            database=bronze_db, table_name=bronze_name
-        )
-        .toDF()
-    )
+    df = glue_context.create_dynamic_frame.from_catalog(
+        database=bronze_db, table_name=bronze_name
+    ).toDF()
     return df.filter(F.col("ingestion_date") == F.lit(ingestion_date))
 
 
@@ -173,7 +170,9 @@ def build_recordlinkage_metrics(vendor_df, existing_current, ingestion_date=None
             "vendor_gk", "canonical_name", "normalized_name"
         ).toPandas()
         if not existing_pdf_all.empty:
-            existing_pdf_all["vendor_gk"] = existing_pdf_all["vendor_gk"].astype("Int64")  # nullable int64
+            existing_pdf_all["vendor_gk"] = existing_pdf_all["vendor_gk"].astype(
+                "Int64"
+            )  # nullable int64
             existing_pdf_all["entity_id"] = "G:" + existing_pdf_all["vendor_gk"].astype(
                 str
             )
@@ -358,8 +357,12 @@ def build_debug_vendor_match_pairs(
                     "source_id_2": get_source_id(info2),
                     "entity_type_1": info1.get("entity_type") if info1 else None,
                     "entity_type_2": info2.get("entity_type") if info2 else None,
-                    "normalized_name_1": info1.get("normalized_name") if info1 else None,
-                    "normalized_name_2": info2.get("normalized_name") if info2 else None,
+                    "normalized_name_1": info1.get("normalized_name")
+                    if info1
+                    else None,
+                    "normalized_name_2": info2.get("normalized_name")
+                    if info2
+                    else None,
                     "match_confidence": row.match_confidence,
                     "match_group_1": mg1,
                     "match_group_2": mg2,
@@ -402,8 +405,12 @@ def build_debug_vendor_match_pairs(
     result_df = pd.DataFrame(rows)
     # Ensure match_group columns are int64 to prevent precision loss when converting to Spark
     if not result_df.empty:
-        result_df["match_group_1"] = result_df["match_group_1"].astype("Int64")  # nullable int64
-        result_df["match_group_2"] = result_df["match_group_2"].astype("Int64")  # nullable int64
+        result_df["match_group_1"] = result_df["match_group_1"].astype(
+            "Int64"
+        )  # nullable int64
+        result_df["match_group_2"] = result_df["match_group_2"].astype(
+            "Int64"
+        )  # nullable int64
         result_df["source_id_1"] = result_df["source_id_1"].astype("Int64")
         result_df["source_id_2"] = result_df["source_id_2"].astype("Int64")
     return result_df
@@ -469,45 +476,55 @@ def apply_survivorship_rules(vendor_scored):
 
 
 def build_master_records(vendor_scored, existing_current):
-    canonical_name = F.coalesce(F.col("vendor_name"), F.col("normalized_name"))
+    new_canonical = F.coalesce(F.col("vendor_name"), F.col("normalized_name"))
     if existing_current is None:
         return vendor_scored.select(
             F.abs(
                 F.xxhash64(
                     F.concat_ws(
-                        "|", canonical_name, F.col("match_group").cast("string")
+                        "|", new_canonical, F.col("match_group").cast("string")
                     )
                 )
             )
             .cast("long")
             .alias("vendor_gk"),
-            canonical_name.alias("canonical_name"),
+            new_canonical.alias("canonical_name"),
             F.col("record_hash"),
             F.col("match_group"),
         )
 
     existing_gk = existing_current.select(
-        F.col("vendor_gk").alias("existing_vendor_gk")
+        F.col("vendor_gk").alias("existing_vendor_gk"),
+        F.col("canonical_name").alias("existing_canonical_name"),
     )
     joined = vendor_scored.join(
         existing_gk,
         vendor_scored["match_group"] == existing_gk["existing_vendor_gk"],
         "left",
     )
+    # Survivorship: prefer longer name between new and existing canonical
+    best_canonical = F.when(
+        F.col("existing_vendor_gk").isNotNull(),
+        F.when(
+            F.length(new_canonical) > F.length(F.col("existing_canonical_name")),
+            new_canonical,
+        ).otherwise(F.col("existing_canonical_name")),
+    ).otherwise(new_canonical)
+
     return joined.select(
         F.when(F.col("existing_vendor_gk").isNotNull(), F.col("existing_vendor_gk"))
         .otherwise(
             F.abs(
                 F.xxhash64(
                     F.concat_ws(
-                        "|", canonical_name, F.col("match_group").cast("string")
+                        "|", new_canonical, F.col("match_group").cast("string")
                     )
                 )
             )
         )
         .cast("long")
         .alias("vendor_gk"),
-        canonical_name.alias("canonical_name"),
+        best_canonical.alias("canonical_name"),
         F.col("record_hash"),
         F.col("match_group"),
     )
@@ -584,8 +601,6 @@ def build_xref(vendor_scored, group_to_gk, ingestion_date):
         F.lit(ingestion_date).cast("date").alias("valid_from"),
         F.lit(None).cast("date").alias("valid_to"),
         F.lit(True).alias("is_current"),
-        F.col("match_rule"),
-        F.col("match_confidence"),
         F.col("decision"),
     )
 
@@ -600,11 +615,10 @@ def apply_xref_scd2(new_xref, existing_xref, ingestion_date):
     joined = new_xref.alias("n").join(existing_current.alias("e"), "vendor_id", "left")
 
     # Records that exist in both and haven't changed - keep existing
+    # Only compare vendor_gk and decision (not match_rule/match_confidence which are metadata)
     unchanged = joined.filter(
         F.col("e.vendor_id").isNotNull()
         & (F.col("e.vendor_gk") == F.col("n.vendor_gk"))
-        & (F.col("e.match_rule") == F.col("n.match_rule"))
-        & (F.col("e.match_confidence") == F.col("n.match_confidence"))
         & (F.col("e.decision") == F.col("n.decision"))
     ).select("e.*")
 
@@ -613,8 +627,6 @@ def apply_xref_scd2(new_xref, existing_xref, ingestion_date):
         F.col("e.vendor_id").isNotNull()
         & ~(
             (F.col("e.vendor_gk") == F.col("n.vendor_gk"))
-            & (F.col("e.match_rule") == F.col("n.match_rule"))
-            & (F.col("e.match_confidence") == F.col("n.match_confidence"))
             & (F.col("e.decision") == F.col("n.decision"))
         )
     )
@@ -690,8 +702,6 @@ def write_xref_vendor(df, spark, table, path):
             valid_from DATE,
             valid_to DATE,
             is_current BOOLEAN,
-            match_rule STRING,
-            match_confidence DOUBLE,
             decision STRING
         )
         USING DELTA
@@ -705,8 +715,6 @@ def write_xref_vendor(df, spark, table, path):
             "valid_from",
             "valid_to",
             "is_current",
-            "match_rule",
-            "match_confidence",
             "decision",
         )
         .write.format("delta")
@@ -793,7 +801,10 @@ def main():
     if not debug_pairs_df.empty:
         debug_pairs_sdf = spark.createDataFrame(debug_pairs_df)
         write_debug_vendor_match_pairs(
-            debug_pairs_sdf, spark, debug_vendor_match_pairs_table, debug_vendor_match_pairs_path
+            debug_pairs_sdf,
+            spark,
+            debug_vendor_match_pairs_table,
+            debug_vendor_match_pairs_path,
         )
 
     job.commit()
