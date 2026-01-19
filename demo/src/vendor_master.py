@@ -155,7 +155,7 @@ def build_recordlinkage_metrics(vendor_df, existing_current, ingestion_date=None
             empty_debug,
         )
 
-    pdf_all["vendor_id"] = pdf_all["vendor_id"].astype(int)
+    pdf_all["vendor_id"] = pdf_all["vendor_id"].astype("Int64")  # nullable int64
     pdf_all["entity_id"] = "S:" + pdf_all["vendor_id"].astype(str)
     pdf_all["entity_type"] = "S"
 
@@ -173,7 +173,7 @@ def build_recordlinkage_metrics(vendor_df, existing_current, ingestion_date=None
             "vendor_gk", "canonical_name", "normalized_name"
         ).toPandas()
         if not existing_pdf_all.empty:
-            existing_pdf_all["vendor_gk"] = existing_pdf_all["vendor_gk"].astype(int)
+            existing_pdf_all["vendor_gk"] = existing_pdf_all["vendor_gk"].astype("Int64")  # nullable int64
             existing_pdf_all["entity_id"] = "G:" + existing_pdf_all["vendor_gk"].astype(
                 str
             )
@@ -189,7 +189,8 @@ def build_recordlinkage_metrics(vendor_df, existing_current, ingestion_date=None
         ignore_index=True,
     )
 
-    all_ids = pdf_all["vendor_id"].astype(int).tolist()
+    all_ids = pdf_all["vendor_id"].tolist()  # Already Int64, convert to Python ints
+    all_ids = [int(x) for x in all_ids]
     vendor_entities = pdf_all[["vendor_id", "entity_id"]].copy()
 
     matchable = combined.dropna(subset=["normalized_name"]).set_index("entity_id")
@@ -296,6 +297,9 @@ def build_recordlinkage_metrics(vendor_df, existing_current, ingestion_date=None
     metrics_df["match_rule"] = metrics_df["match_confidence"].map(
         lambda c: "EXACT" if c == 1.0 else "RECORDLINKAGE"
     )
+    # Ensure match_group is int64 to prevent precision loss when converting to Spark
+    # (Spark may infer object dtype as DoubleType, losing precision for large integers)
+    metrics_df["match_group"] = metrics_df["match_group"].astype("int64")
 
     debug_pairs_df = build_debug_vendor_match_pairs(
         pairs_df, matchable, entity_to_root, root_to_group, ingestion_date
@@ -395,7 +399,14 @@ def build_debug_vendor_match_pairs(
             }
         )
 
-    return pd.DataFrame(rows)
+    result_df = pd.DataFrame(rows)
+    # Ensure match_group columns are int64 to prevent precision loss when converting to Spark
+    if not result_df.empty:
+        result_df["match_group_1"] = result_df["match_group_1"].astype("Int64")  # nullable int64
+        result_df["match_group_2"] = result_df["match_group_2"].astype("Int64")  # nullable int64
+        result_df["source_id_1"] = result_df["source_id_1"].astype("Int64")
+        result_df["source_id_2"] = result_df["source_id_2"].astype("Int64")
+    return result_df
 
 
 def write_debug_vendor_match_pairs(df, spark, table, path):

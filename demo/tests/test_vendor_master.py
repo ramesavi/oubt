@@ -178,6 +178,34 @@ class TestBuildRecordlinkageMetrics:
         vendor_10 = metrics_df[metrics_df["vendor_id"] == 10].iloc[0]
         assert vendor_10["match_group"] == -10, "vendor_id=10 should get new negative group (no match)"
 
+    def test_large_vendor_gk_precision(self):
+        """Test that large vendor_gk values don't lose precision during matching.
+
+        This reproduces the precision loss bug where 1370979602841426522 becomes
+        1370979602841426432 (difference of 90) due to float64 conversion.
+        """
+        large_gk = 1370979602841426522
+        vendor_data = [
+            {"vendor_id": 8, "vendor_name": "Creative Mobil", "normalized_name": "creative mobil", "record_hash": "h8"},
+        ]
+        existing_data = [
+            {"vendor_gk": large_gk, "canonical_name": "Creative Mobile Technologies, LLC", "normalized_name": "creative mobile"},
+            {"vendor_gk": 2, "canonical_name": "Curb Mobility, LLC", "normalized_name": "curb mobility"},
+        ]
+        vendor_df = self._create_mock_vendor_df(vendor_data)
+        existing_current = self._create_mock_existing_current(existing_data)
+
+        metrics_df, _ = build_recordlinkage_metrics(
+            vendor_df, existing_current=existing_current, ingestion_date="2026-01-19"
+        )
+
+        vendor_8 = metrics_df[metrics_df["vendor_id"] == 8].iloc[0]
+        # The match_group should exactly equal the large vendor_gk, not a rounded value
+        assert vendor_8["match_group"] == large_gk, (
+            f"vendor_id=8 should match existing master gk={large_gk}, "
+            f"got {vendor_8['match_group']} (diff={large_gk - vendor_8['match_group']})"
+        )
+
 
 class TestExpectedDimVendorCount:
     """Tests to verify expected record counts after Day 1 and Day 2 runs."""
