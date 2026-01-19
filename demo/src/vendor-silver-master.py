@@ -11,7 +11,7 @@ from pyspark.sql.window import Window
 def get_glue_args_master(argv):
     return getResolvedOptions(
         argv,
-        ["JOB_NAME", "silver_db", "master_db", "ingestion_date", "output_path"],
+        ["JOB_NAME", "silver_db", "master_db", "ingestion_date", "output_path", "debug_db"],
     )
 
 
@@ -20,18 +20,22 @@ def parse_args(argv):
     silver_table = f"{args['silver_db']}.vendor"
     master_dim_table = f"{args['master_db']}.dim_vendor"
     master_xref_table = f"{args['master_db']}.xref_vendor"
+    debug_vendor_match_pairs_table = f"{args['debug_db']}.debug_vendor_match_pairs"
     ingestion_date = args["ingestion_date"]
     output_path = args["output_path"]
     dim_vendor_path = f"{output_path}/dim_vendor"
     xref_vendor_path = f"{output_path}/xref_vendor"
+    debug_vendor_match_pairs_path = f"{output_path}/debug_vendor_match_pairs"
     return (
         args,
         silver_table,
         master_dim_table,
         master_xref_table,
+        debug_vendor_match_pairs_table,
         ingestion_date,
         dim_vendor_path,
         xref_vendor_path,
+        debug_vendor_match_pairs_path,
     )
 
 
@@ -69,16 +73,36 @@ def generate_record_hash(df):
     )
 
 
-def build_recordlinkage_metrics(silver_df, existing_current):
+def build_recordlinkage_metrics(silver_df, existing_current, ingestion_date=None):
     pdf_all = (
         silver_df.select("vendor_id", "vendor_name", "normalized_name", "record_hash")
         .dropna(subset=["vendor_id"])
         .toPandas()
     )
 
+    empty_debug = pd.DataFrame(
+        columns=[
+            "ingestion_date",
+            "source_id_1",
+            "source_id_2",
+            "entity_type_1",
+            "entity_type_2",
+            "normalized_name_1",
+            "normalized_name_2",
+            "match_confidence",
+            "match_group_1",
+            "match_group_2",
+            "same_group",
+            "above_threshold",
+        ]
+    )
+
     if pdf_all.empty and existing_current is None:
-        return pd.DataFrame(
-            columns=["vendor_id", "match_group", "match_confidence", "match_rule"]
+        return (
+            pd.DataFrame(
+                columns=["vendor_id", "match_group", "match_confidence", "match_rule"]
+            ),
+            empty_debug,
         )
 
     pdf_all["vendor_id"] = pdf_all["vendor_id"].astype(int)
@@ -124,7 +148,7 @@ def build_recordlinkage_metrics(silver_df, existing_current):
         metrics_df["match_group"] = metrics_df["vendor_id"].map(lambda v: -int(v))
         metrics_df["match_confidence"] = 0.0
         metrics_df["match_rule"] = "RECORDLINKAGE"
-        return metrics_df
+        return metrics_df, empty_debug
 
     pairs_df = pd.DataFrame(columns=["vendor_id_1", "vendor_id_2", "match_confidence"])
     indexer = rl.Index()
@@ -222,7 +246,154 @@ def build_recordlinkage_metrics(silver_df, existing_current):
     metrics_df["match_rule"] = metrics_df["match_confidence"].map(
         lambda c: "EXACT" if c == 1.0 else "RECORDLINKAGE"
     )
-    return metrics_df[["vendor_id", "match_group", "match_confidence", "match_rule"]]
+
+    debug_pairs_df = build_debug_vendor_match_pairs(
+        pairs_df, matchable, entity_to_root, root_to_group, ingestion_date
+    )
+
+    return (
+        metrics_df[["vendor_id", "match_group", "match_confidence", "match_rule"]],
+        debug_pairs_df,
+    )
+
+
+def build_debug_vendor_match_pairs(
+    pairs_df, matchable, entity_to_root, root_to_group, ingestion_date
+):
+    """Build debug pairs dataframe including unmatched entities."""
+    matchable_reset = matchable.reset_index()
+
+    entity_info = {}
+    for row in matchable_reset.itertuples(index=False):
+        entity_info[row.entity_id] = {
+            "entity_type": row.entity_type,
+            "normalized_name": row.normalized_name,
+            "vendor_id": getattr(row, "vendor_id", None),
+            "vendor_gk": getattr(row, "vendor_gk", None),
+        }
+
+    def get_source_id(info):
+        if info is None:
+            return None
+        if info["entity_type"] == "S":
+            vid = info.get("vendor_id")
+            return int(vid) if vid is not None else None
+        gk = info.get("vendor_gk")
+        return int(gk) if gk is not None else None
+
+    def get_match_group(entity_id):
+        if entity_id in entity_to_root:
+            root = entity_to_root[entity_id]
+            return root_to_group.get(root)
+        return None
+
+    rows = []
+
+    if not pairs_df.empty:
+        for row in pairs_df.itertuples(index=False):
+            e1, e2 = row.entity_id_1, row.entity_id_2
+            info1 = entity_info.get(e1)
+            info2 = entity_info.get(e2)
+            mg1 = get_match_group(e1)
+            mg2 = get_match_group(e2)
+
+            rows.append(
+                {
+                    "ingestion_date": ingestion_date,
+                    "source_id_1": get_source_id(info1),
+                    "source_id_2": get_source_id(info2),
+                    "entity_type_1": info1.get("entity_type") if info1 else None,
+                    "entity_type_2": info2.get("entity_type") if info2 else None,
+                    "normalized_name_1": info1.get("normalized_name") if info1 else None,
+                    "normalized_name_2": info2.get("normalized_name") if info2 else None,
+                    "match_confidence": row.match_confidence,
+                    "match_group_1": mg1,
+                    "match_group_2": mg2,
+                    "same_group": mg1 == mg2
+                    if (mg1 is not None and mg2 is not None)
+                    else False,
+                    "above_threshold": row.match_confidence >= 0.75,
+                }
+            )
+
+    entities_in_pairs = set()
+    if not pairs_df.empty:
+        entities_in_pairs = set(pairs_df["entity_id_1"]).union(
+            set(pairs_df["entity_id_2"])
+        )
+
+    all_entities = set(matchable.index.tolist())
+    unmatched = all_entities - entities_in_pairs
+
+    for entity_id in unmatched:
+        info = entity_info.get(entity_id)
+        mg = get_match_group(entity_id)
+        rows.append(
+            {
+                "ingestion_date": ingestion_date,
+                "source_id_1": get_source_id(info),
+                "source_id_2": None,
+                "entity_type_1": info.get("entity_type") if info else None,
+                "entity_type_2": None,
+                "normalized_name_1": info.get("normalized_name") if info else None,
+                "normalized_name_2": None,
+                "match_confidence": 0.0,
+                "match_group_1": mg,
+                "match_group_2": None,
+                "same_group": False,
+                "above_threshold": False,
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def write_debug_vendor_match_pairs(df, spark, table, path):
+    """
+    Create debug_vendor_match_pairs table if missing and overwrite the data.
+    Partitioned by ingestion_date.
+    """
+    spark.sql(
+        f"""
+        CREATE TABLE IF NOT EXISTS {table} (
+            source_id_1 LONG,
+            source_id_2 LONG,
+            entity_type_1 STRING,
+            entity_type_2 STRING,
+            normalized_name_1 STRING,
+            normalized_name_2 STRING,
+            match_confidence DOUBLE,
+            match_group_1 LONG,
+            match_group_2 LONG,
+            same_group BOOLEAN,
+            above_threshold BOOLEAN,
+            ingestion_date DATE
+        )
+        USING DELTA
+        PARTITIONED BY (ingestion_date)
+        LOCATION '{path}'
+        """
+    )
+    (
+        df.select(
+            "source_id_1",
+            "source_id_2",
+            "entity_type_1",
+            "entity_type_2",
+            "normalized_name_1",
+            "normalized_name_2",
+            "match_confidence",
+            "match_group_1",
+            "match_group_2",
+            "same_group",
+            "above_threshold",
+            "ingestion_date",
+        )
+        .write.format("delta")
+        .mode("overwrite")
+        .option("replaceWhere", f"ingestion_date = '{df.first()['ingestion_date']}'")
+        .save(path)
+    )
 
 
 def apply_survivorship_rules(vendor_scored):
@@ -467,9 +638,11 @@ def main():
         silver_table,
         master_dim_table,
         master_xref_table,
+        debug_vendor_match_pairs_table,
         ingestion_date,
         dim_vendor_path,
         xref_vendor_path,
+        debug_vendor_match_pairs_path,
     ) = parse_args(sys.argv)
     spark, glue_context, job = init_spark(args)
 
@@ -495,7 +668,9 @@ def main():
             .select("vendor_gk", "canonical_name", "normalized_name")
         )
 
-    metrics_df = build_recordlinkage_metrics(silver_df, existing_current)
+    metrics_df, debug_pairs_df = build_recordlinkage_metrics(
+        silver_df, existing_current, ingestion_date
+    )
     metrics_sdf = spark.createDataFrame(metrics_df).select(
         F.col("vendor_id").cast("int"),
         F.col("match_group").cast("long"),
@@ -528,6 +703,12 @@ def main():
 
     write_dim_vendor(final_dim_vendor, spark, master_dim_table, dim_vendor_path)
     write_xref_vendor(final_xref_vendor, spark, master_xref_table, xref_vendor_path)
+
+    if not debug_pairs_df.empty:
+        debug_pairs_sdf = spark.createDataFrame(debug_pairs_df)
+        write_debug_vendor_match_pairs(
+            debug_pairs_sdf, spark, debug_vendor_match_pairs_table, debug_vendor_match_pairs_path
+        )
 
     job.commit()
 
