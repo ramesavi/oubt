@@ -8,20 +8,20 @@ from pyspark.sql import functions as F
 from pyspark.sql.window import Window
 
 
-def get_glue_args_gold(argv):
+def get_glue_args_master(argv):
     return getResolvedOptions(
         argv,
-        ["JOB_NAME", "silver_db", "gold_db", "ingestion_date"],
+        ["JOB_NAME", "silver_db", "master_db", "ingestion_date"],
     )
 
 
 def parse_args(argv):
-    args = get_glue_args_gold(argv)
+    args = get_glue_args_master(argv)
     silver_table = f"{args['silver_db']}.vendor"
-    gold_dim_table = f"{args['gold_db']}.dim_vendor"
-    gold_xref_table = f"{args['gold_db']}.xref_vendor"
+    master_dim_table = f"{args['master_db']}.dim_vendor"
+    master_xref_table = f"{args['master_db']}.xref_vendor"
     ingestion_date = args["ingestion_date"]
-    return args, silver_table, gold_dim_table, gold_xref_table, ingestion_date
+    return args, silver_table, master_dim_table, master_xref_table, ingestion_date
 
 
 def init_spark(args):
@@ -225,7 +225,7 @@ def apply_survivorship_rules(vendor_scored):
     )
 
 
-def build_golden_records(vendor_scored, existing_current):
+def build_master_records(vendor_scored, existing_current):
     canonical_name = F.coalesce(F.col("vendor_name"), F.col("normalized_name"))
     if existing_current is None:
         return vendor_scored.select(
@@ -378,12 +378,12 @@ def apply_xref_scd2(new_xref, existing_xref, ingestion_date):
     )
 
 
-def write_gold_table(df, table, spark):
+def write_master_table(df, table, spark):
     df.write.format("delta").mode("overwrite").saveAsTable(table)
 
 
 def main():
-    args, silver_table, gold_dim_table, gold_xref_table, ingestion_date = parse_args(
+    args, silver_table, master_dim_table, master_xref_table, ingestion_date = parse_args(
         sys.argv
     )
     spark, glue_context, job = init_spark(args)
@@ -396,8 +396,8 @@ def main():
     silver_df = generate_record_hash(silver_df)
 
     existing_dim = (
-        spark.read.table(gold_dim_table)
-        if spark.catalog.tableExists(gold_dim_table)
+        spark.read.table(master_dim_table)
+        if spark.catalog.tableExists(master_dim_table)
         else None
     )
     existing_current = None
@@ -427,22 +427,22 @@ def main():
         .otherwise(F.lit("NO_MATCH")),
     )
 
-    golden_candidates = apply_survivorship_rules(silver_scored)
-    golden_records = build_golden_records(golden_candidates, existing_current)
+    master_candidates = apply_survivorship_rules(silver_scored)
+    master_records = build_master_records(master_candidates, existing_current)
 
-    final_dim_vendor = apply_scd_type_2(golden_records, existing_dim, ingestion_date)
+    final_dim_vendor = apply_scd_type_2(master_records, existing_dim, ingestion_date)
 
-    group_to_gk = golden_records.select("match_group", "vendor_gk")
+    group_to_gk = master_records.select("match_group", "vendor_gk")
     new_xref = build_xref(silver_scored, group_to_gk, ingestion_date)
     existing_xref = (
-        spark.read.table(gold_xref_table)
-        if spark.catalog.tableExists(gold_xref_table)
+        spark.read.table(master_xref_table)
+        if spark.catalog.tableExists(master_xref_table)
         else None
     )
     final_xref_vendor = apply_xref_scd2(new_xref, existing_xref, ingestion_date)
 
-    write_gold_table(final_dim_vendor, gold_dim_table, spark)
-    write_gold_table(final_xref_vendor, gold_xref_table, spark)
+    write_master_table(final_dim_vendor, master_dim_table, spark)
+    write_master_table(final_xref_vendor, master_xref_table, spark)
 
     job.commit()
 
