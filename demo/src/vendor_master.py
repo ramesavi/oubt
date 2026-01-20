@@ -5,7 +5,18 @@ import recordlinkage as rl
 from awsglue.utils import getResolvedOptions
 from glue_utils import init_glue_job
 from pyspark.sql import functions as F
-from pyspark.sql.window import Window
+
+
+DEBUG_COLUMNS = [
+    "ingestion_date", "source_id_1", "source_id_2", "entity_type_1", "entity_type_2",
+    "normalized_name_1", "normalized_name_2", "match_confidence",
+    "match_group_1", "match_group_2", "same_group", "above_threshold",
+]
+
+# Match confidence thresholds
+THRESHOLD_AUTO = 0.95           # Above this: automatic match
+THRESHOLD_STEWARD = 0.85        # Above this: steward review
+THRESHOLD_MATCH = 0.75          # Above this: considered a match
 
 
 def get_glue_args(argv):
@@ -114,115 +125,69 @@ def transform_bronze(df):
     return df.dropDuplicates(["vendor_id"])
 
 
-def generate_record_hash(df):
-    return df.withColumn(
-        "record_hash", F.sha2(F.concat_ws("|", F.col("normalized_name")), 256)
+def build_recordlinkage_metrics(vendor_df, existing_masters, ingestion_date=None):
+    """
+    Match new vendors against existing masters using Jaro-Winkler similarity.
+
+    Returns:
+        metrics_df: DataFrame with vendor_id, match_group, match_confidence
+        debug_pairs_df: DataFrame with all pair comparisons for debugging
+    """
+    empty_result = (
+        pd.DataFrame(columns=["vendor_id", "match_group", "match_confidence"]),
+        pd.DataFrame(columns=DEBUG_COLUMNS),
     )
 
+    new_vendors_pdf = (
+        vendor_df.select("vendor_id", "vendor_name", "normalized_name")
+        .dropna(subset=["vendor_id"]).toPandas()
+    )
+    if new_vendors_pdf.empty and existing_masters is None:
+        return empty_result
 
-def build_recordlinkage_metrics(vendor_df, existing_current, ingestion_date=None):
-    pdf_all = (
-        vendor_df.select("vendor_id", "vendor_name", "normalized_name", "record_hash")
-        .dropna(subset=["vendor_id"])
-        .toPandas()
+    new_vendors_pdf = new_vendors_pdf.assign(
+        vendor_id=lambda df: df["vendor_id"].astype("Int64"),
+        entity_id=lambda df: "S:" + df["vendor_id"].astype(str),
+        entity_type="S",
     )
 
-    empty_debug = pd.DataFrame(
-        columns=[
-            "ingestion_date",
-            "source_id_1",
-            "source_id_2",
-            "entity_type_1",
-            "entity_type_2",
-            "normalized_name_1",
-            "normalized_name_2",
-            "match_confidence",
-            "match_group_1",
-            "match_group_2",
-            "same_group",
-            "above_threshold",
-        ]
-    )
+    existing_masters_pdf = pd.DataFrame(columns=["vendor_gk", "normalized_name", "entity_id", "entity_type"])
+    if existing_masters is not None:
+        existing_masters_pdf = existing_masters.select("vendor_gk", "canonical_name", "normalized_name").toPandas()
+        if not existing_masters_pdf.empty:
+            existing_masters_pdf = existing_masters_pdf.assign(
+                vendor_gk=lambda df: df["vendor_gk"].astype("Int64"),
+                entity_id=lambda df: "G:" + df["vendor_gk"].astype(str),
+                entity_type="G",
+            )
 
-    if pdf_all.empty and existing_current is None:
+    all_entities = pd.concat([
+        new_vendors_pdf[["entity_id", "entity_type", "vendor_id", "normalized_name"]],
+        existing_masters_pdf[["entity_id", "entity_type", "vendor_gk", "normalized_name"]],
+    ], ignore_index=True)
+
+    vendor_entities = new_vendors_pdf[["vendor_id", "entity_id"]].copy()
+    matchable = all_entities.dropna(subset=["normalized_name"]).set_index("entity_id")
+    if matchable.empty:
         return (
-            pd.DataFrame(
-                columns=["vendor_id", "match_group", "match_confidence", "match_rule"]
-            ),
-            empty_debug,
+            vendor_entities.assign(match_group=-vendor_entities["vendor_id"].astype(int), match_confidence=0.0),
+            empty_result[1],
         )
 
-    pdf_all["vendor_id"] = pdf_all["vendor_id"].astype("Int64")  # nullable int64
-    pdf_all["entity_id"] = "S:" + pdf_all["vendor_id"].astype(str)
-    pdf_all["entity_type"] = "S"
-
-    existing_pdf_all = pd.DataFrame(
-        columns=[
-            "vendor_gk",
-            "canonical_name",
-            "normalized_name",
-            "entity_id",
-            "entity_type",
-        ]
-    )
-    if existing_current is not None:
-        existing_pdf_all = existing_current.select(
-            "vendor_gk", "canonical_name", "normalized_name"
-        ).toPandas()
-        if not existing_pdf_all.empty:
-            existing_pdf_all["vendor_gk"] = existing_pdf_all["vendor_gk"].astype(
-                "Int64"
-            )  # nullable int64
-            existing_pdf_all["entity_id"] = "G:" + existing_pdf_all["vendor_gk"].astype(
-                str
-            )
-            existing_pdf_all["entity_type"] = "G"
-
-    combined = pd.concat(
-        [
-            pdf_all[["entity_id", "entity_type", "vendor_id", "normalized_name"]],
-            existing_pdf_all[
-                ["entity_id", "entity_type", "vendor_gk", "normalized_name"]
-            ],
-        ],
-        ignore_index=True,
-    )
-
-    all_ids = pdf_all["vendor_id"].tolist()  # Already Int64, convert to Python ints
-    all_ids = [int(x) for x in all_ids]
-    vendor_entities = pdf_all[["vendor_id", "entity_id"]].copy()
-
-    matchable = combined.dropna(subset=["normalized_name"]).set_index("entity_id")
-    if matchable.empty:
-        metrics_df = pd.DataFrame({"vendor_id": all_ids})
-        metrics_df["match_group"] = metrics_df["vendor_id"].map(lambda v: -int(v))
-        metrics_df["match_confidence"] = 0.0
-        metrics_df["match_rule"] = "RECORDLINKAGE"
-        return metrics_df, empty_debug
-
-    pairs_df = pd.DataFrame(columns=["vendor_id_1", "vendor_id_2", "match_confidence"])
+    # Compute pairwise Jaro-Winkler similarity
     indexer = rl.Index()
     indexer.full()
-    pairs = indexer.index(matchable)
-
     compare = rl.Compare()
-    compare.string(
-        "normalized_name",
-        "normalized_name",
-        method="jarowinkler",
-        label="match_confidence",
-    )
-    features = compare.compute(pairs, matchable)
+    compare.string("normalized_name", "normalized_name", method="jarowinkler", label="match_confidence")
     pairs_df = (
-        features.reset_index()
+        compare.compute(indexer.index(matchable), matchable)
+        .reset_index()
         .rename(columns={"level_0": "entity_id_1", "level_1": "entity_id_2"})
-        .sort_values(
-            ["match_confidence", "entity_id_1", "entity_id_2"],
-            ascending=[False, True, True],
-        )
+        .sort_values(["match_confidence", "entity_id_1", "entity_id_2"], ascending=[False, True, True])
     )
 
-    parent = {eid: eid for eid in matchable.index.tolist()}
+    # Union-Find to group matching entities
+    parent = {eid: eid for eid in matchable.index}
 
     def find(x):
         while parent[x] != x:
@@ -235,185 +200,72 @@ def build_recordlinkage_metrics(vendor_df, existing_current, ingestion_date=None
         if ra != rb:
             parent[rb] = ra
 
+    # Union entities above threshold that involve at least one source vendor
     edges = pairs_df[
-        (pairs_df["match_confidence"] >= 0.75)
-        & (
-            pairs_df["entity_id_1"].str.startswith("S:")
-            | pairs_df["entity_id_2"].str.startswith("S:")
-        )
-    ][["entity_id_1", "entity_id_2"]]
-    for a, b in edges.itertuples(index=False):
+        (pairs_df["match_confidence"] >= THRESHOLD_MATCH)
+        & (pairs_df["entity_id_1"].str.startswith("S:") | pairs_df["entity_id_2"].str.startswith("S:"))
+    ]
+    for a, b in edges[["entity_id_1", "entity_id_2"]].itertuples(index=False):
         union(a, b)
 
     entity_to_root = {eid: find(eid) for eid in parent}
 
-    root_to_gk = {}
-    root_to_min_vendor = {}
-    matchable_reset = matchable.reset_index()
-    for row in matchable_reset.itertuples(index=False):
-        entity_id = row.entity_id
-        root = entity_to_root.get(entity_id, entity_id)
+    # Build root -> group mapping (prefer existing gk, else negative min vendor_id)
+    root_to_gk, root_to_min_vid = {}, {}
+    for row in matchable.reset_index().itertuples(index=False):
+        root = entity_to_root.get(row.entity_id, row.entity_id)
         if row.entity_type == "G":
-            gk = int(row.vendor_gk)
-            root_to_gk[root] = min(gk, root_to_gk.get(root, gk))
+            root_to_gk[root] = min(int(row.vendor_gk), root_to_gk.get(root, int(row.vendor_gk)))
         else:
-            vid = int(row.vendor_id)
-            root_to_min_vendor[root] = min(vid, root_to_min_vendor.get(root, vid))
+            root_to_min_vid[root] = min(int(row.vendor_id), root_to_min_vid.get(root, int(row.vendor_id)))
 
-    root_to_group = {}
-    for root, min_vid in root_to_min_vendor.items():
-        if root in root_to_gk:
-            root_to_group[root] = root_to_gk[root]
-        else:
-            root_to_group[root] = -min_vid
+    root_to_group = {root: root_to_gk.get(root, -min_vid) for root, min_vid in root_to_min_vid.items()}
 
-    def group_id_for_entity(entity_id, vendor_id):
-        if entity_id in entity_to_root:
-            root = entity_to_root[entity_id]
-            return root_to_group.get(root, -int(vendor_id))
-        return -int(vendor_id)
+    # Map each vendor to its group
+    def get_group(entity_id, vendor_id):
+        root = entity_to_root.get(entity_id)
+        return root_to_group.get(root, -int(vendor_id)) if root else -int(vendor_id)
 
-    groups_df = vendor_entities.copy()
-    groups_df["match_group"] = groups_df.apply(
-        lambda row: group_id_for_entity(row["entity_id"], row["vendor_id"]), axis=1
-    )
+    vendor_entities["match_group"] = vendor_entities.apply(
+        lambda r: get_group(r["entity_id"], r["vendor_id"]), axis=1
+    ).astype("int64")
 
-    best = pd.Series(0.0, index=vendor_entities["entity_id"].tolist())
-    if not pairs_df.empty:
-        pairs_for_best = pairs_df[
-            pairs_df["entity_id_1"].str.startswith("S:")
-            | pairs_df["entity_id_2"].str.startswith("S:")
-        ]
-        best_left = pairs_for_best.groupby("entity_id_1")["match_confidence"].max()
-        best_right = pairs_for_best.groupby("entity_id_2")["match_confidence"].max()
-        best = best_left.combine(best_right, max).reindex(
-            vendor_entities["entity_id"].tolist(), fill_value=0.0
-        )
-
-    metrics_df = groups_df.assign(
-        match_confidence=groups_df["entity_id"].map(best).fillna(0.0),
-    )
-    metrics_df["match_rule"] = metrics_df["match_confidence"].map(
-        lambda c: "EXACT" if c == 1.0 else "RECORDLINKAGE"
-    )
-    # Ensure match_group is int64 to prevent precision loss when converting to Spark
-    # (Spark may infer object dtype as DoubleType, losing precision for large integers)
-    metrics_df["match_group"] = metrics_df["match_group"].astype("int64")
+    # Calculate best confidence for each vendor
+    vendor_pairs = pairs_df[pairs_df["entity_id_1"].str.startswith("S:") | pairs_df["entity_id_2"].str.startswith("S:")]
+    best_left = vendor_pairs.groupby("entity_id_1")["match_confidence"].max()
+    best_right = vendor_pairs.groupby("entity_id_2")["match_confidence"].max()
+    best_confidence = best_left.combine(best_right, max, fill_value=0.0)
+    vendor_entities["match_confidence"] = vendor_entities["entity_id"].map(best_confidence).fillna(0.0)
 
     debug_pairs_df = build_debug_vendor_match_pairs(
         pairs_df, matchable, entity_to_root, root_to_group, ingestion_date
     )
+    return vendor_entities[["vendor_id", "match_group", "match_confidence"]], debug_pairs_df
 
-    return (
-        metrics_df[["vendor_id", "match_group", "match_confidence", "match_rule"]],
-        debug_pairs_df,
+
+def build_debug_vendor_match_pairs(pairs_df, matchable, entity_to_root, root_to_group, ingestion_date):
+    """Build debug dataframe with match pair details for analysis."""
+    if pairs_df.empty:
+        return pd.DataFrame(columns=DEBUG_COLUMNS)
+
+    # Build lookup: entity_id -> {source_id, entity_type, normalized_name, match_group}
+    entity_info = matchable.reset_index().assign(
+        source_id=lambda df: df.apply(lambda r: r["vendor_id"] if r["entity_type"] == "S" else r["vendor_gk"], axis=1),
+        match_group=lambda df: df["entity_id"].map(lambda eid: root_to_group.get(entity_to_root.get(eid, eid))),
     )
+    lookup = entity_info.set_index("entity_id")[["source_id", "entity_type", "normalized_name", "match_group"]].to_dict("index")
 
+    result = pairs_df[["match_confidence"]].assign(ingestion_date=ingestion_date)
+    for suffix in ["_1", "_2"]:
+        for field in ["source_id", "entity_type", "normalized_name", "match_group"]:
+            result[f"{field}{suffix}"] = pairs_df[f"entity_id{suffix}"].map(lambda e, f=field: lookup.get(e, {}).get(f))
 
-def build_debug_vendor_match_pairs(
-    pairs_df, matchable, entity_to_root, root_to_group, ingestion_date
-):
-    """Build debug pairs dataframe including unmatched entities."""
-    matchable_reset = matchable.reset_index()
+    result["same_group"] = (result["match_group_1"] == result["match_group_2"]) & result["match_group_1"].notna()
+    result["above_threshold"] = result["match_confidence"] >= THRESHOLD_MATCH
+    for col in ["match_group_1", "match_group_2", "source_id_1", "source_id_2"]:
+        result[col] = result[col].astype("Int64")
 
-    entity_info = {}
-    for row in matchable_reset.itertuples(index=False):
-        entity_info[row.entity_id] = {
-            "entity_type": row.entity_type,
-            "normalized_name": row.normalized_name,
-            "vendor_id": getattr(row, "vendor_id", None),
-            "vendor_gk": getattr(row, "vendor_gk", None),
-        }
-
-    def get_source_id(info):
-        if info is None:
-            return None
-        if info["entity_type"] == "S":
-            vid = info.get("vendor_id")
-            return int(vid) if vid is not None else None
-        gk = info.get("vendor_gk")
-        return int(gk) if gk is not None else None
-
-    def get_match_group(entity_id):
-        if entity_id in entity_to_root:
-            root = entity_to_root[entity_id]
-            return root_to_group.get(root)
-        return None
-
-    rows = []
-
-    if not pairs_df.empty:
-        for row in pairs_df.itertuples(index=False):
-            e1, e2 = row.entity_id_1, row.entity_id_2
-            info1 = entity_info.get(e1)
-            info2 = entity_info.get(e2)
-            mg1 = get_match_group(e1)
-            mg2 = get_match_group(e2)
-
-            rows.append(
-                {
-                    "ingestion_date": ingestion_date,
-                    "source_id_1": get_source_id(info1),
-                    "source_id_2": get_source_id(info2),
-                    "entity_type_1": info1.get("entity_type") if info1 else None,
-                    "entity_type_2": info2.get("entity_type") if info2 else None,
-                    "normalized_name_1": info1.get("normalized_name")
-                    if info1
-                    else None,
-                    "normalized_name_2": info2.get("normalized_name")
-                    if info2
-                    else None,
-                    "match_confidence": row.match_confidence,
-                    "match_group_1": mg1,
-                    "match_group_2": mg2,
-                    "same_group": mg1 == mg2
-                    if (mg1 is not None and mg2 is not None)
-                    else False,
-                    "above_threshold": row.match_confidence >= 0.75,
-                }
-            )
-
-    entities_in_pairs = set()
-    if not pairs_df.empty:
-        entities_in_pairs = set(pairs_df["entity_id_1"]).union(
-            set(pairs_df["entity_id_2"])
-        )
-
-    all_entities = set(matchable.index.tolist())
-    unmatched = all_entities - entities_in_pairs
-
-    for entity_id in unmatched:
-        info = entity_info.get(entity_id)
-        mg = get_match_group(entity_id)
-        rows.append(
-            {
-                "ingestion_date": ingestion_date,
-                "source_id_1": get_source_id(info),
-                "source_id_2": None,
-                "entity_type_1": info.get("entity_type") if info else None,
-                "entity_type_2": None,
-                "normalized_name_1": info.get("normalized_name") if info else None,
-                "normalized_name_2": None,
-                "match_confidence": 0.0,
-                "match_group_1": mg,
-                "match_group_2": None,
-                "same_group": False,
-                "above_threshold": False,
-            }
-        )
-
-    result_df = pd.DataFrame(rows)
-    # Ensure match_group columns are int64 to prevent precision loss when converting to Spark
-    if not result_df.empty:
-        result_df["match_group_1"] = result_df["match_group_1"].astype(
-            "Int64"
-        )  # nullable int64
-        result_df["match_group_2"] = result_df["match_group_2"].astype(
-            "Int64"
-        )  # nullable int64
-        result_df["source_id_1"] = result_df["source_id_1"].astype("Int64")
-        result_df["source_id_2"] = result_df["source_id_2"].astype("Int64")
-    return result_df
+    return result[DEBUG_COLUMNS]
 
 
 def write_debug_vendor_match_pairs(df, spark, table, path):
@@ -464,203 +316,55 @@ def write_debug_vendor_match_pairs(df, spark, table, path):
     )
 
 
-def apply_survivorship_rules(vendor_scored):
-    window = Window.partitionBy("match_group").orderBy(
-        F.desc(F.length("vendor_name")), F.asc("vendor_id")
-    )
-    return (
-        vendor_scored.withColumn("rn", F.row_number().over(window))
-        .filter(F.col("rn") == 1)
-        .drop("rn")
-    )
-
-
-def build_master_records(vendor_scored, existing_current):
-    new_canonical = F.coalesce(F.col("vendor_name"), F.col("normalized_name"))
-    if existing_current is None:
-        return vendor_scored.select(
-            F.abs(
-                F.xxhash64(
-                    F.concat_ws(
-                        "|", new_canonical, F.col("match_group").cast("string")
-                    )
-                )
-            )
-            .cast("long")
-            .alias("vendor_gk"),
-            new_canonical.alias("canonical_name"),
-            F.col("record_hash"),
-            F.col("match_group"),
-        )
-
-    existing_gk = existing_current.select(
-        F.col("vendor_gk").alias("existing_vendor_gk"),
-        F.col("canonical_name").alias("existing_canonical_name"),
-    )
-    joined = vendor_scored.join(
-        existing_gk,
-        vendor_scored["match_group"] == existing_gk["existing_vendor_gk"],
-        "left",
-    )
-    # Survivorship: prefer longer name between new and existing canonical
-    best_canonical = F.when(
-        F.col("existing_vendor_gk").isNotNull(),
-        F.when(
-            F.length(new_canonical) > F.length(F.col("existing_canonical_name")),
-            new_canonical,
-        ).otherwise(F.col("existing_canonical_name")),
-    ).otherwise(new_canonical)
-
-    return joined.select(
-        F.when(F.col("existing_vendor_gk").isNotNull(), F.col("existing_vendor_gk"))
-        .otherwise(
-            F.abs(
-                F.xxhash64(
-                    F.concat_ws(
-                        "|", new_canonical, F.col("match_group").cast("string")
-                    )
-                )
-            )
-        )
-        .cast("long")
-        .alias("vendor_gk"),
-        best_canonical.alias("canonical_name"),
-        F.col("record_hash"),
-        F.col("match_group"),
-    )
-
-
-def apply_scd_type_2(new_dim, existing_dim, ingestion_date):
-    new_dim_base = new_dim.select(
-        "vendor_gk",
-        "canonical_name",
-        F.lit(ingestion_date).cast("date").alias("valid_from"),
-        F.lit(None).cast("date").alias("valid_to"),
-        F.lit(True).alias("is_current"),
-        F.lit("NEW").alias("change_reason"),
-        "record_hash",
-    )
-
-    if existing_dim is None:
-        return new_dim_base
-
-    existing_current = existing_dim.filter(F.col("is_current") == F.lit(True))
-    existing_hist = existing_dim.filter(F.col("is_current") == F.lit(False))
-
-    joined = new_dim_base.alias("n").join(
-        existing_current.alias("e"), "vendor_gk", "left"
-    )
-
-    # Records that exist in both and haven't changed - keep existing
-    unchanged = joined.filter(
-        F.col("e.vendor_gk").isNotNull()
-        & (F.col("n.record_hash") == F.col("e.record_hash"))
-    ).select("e.*")
-
-    # Records that exist in both but have changed
-    changed = joined.filter(
-        F.col("e.vendor_gk").isNotNull()
-        & (F.col("n.record_hash") != F.col("e.record_hash"))
-    )
-    # Close old records
-    closed = (
-        changed.select("e.*")
-        .withColumn("valid_to", F.date_sub(F.lit(ingestion_date).cast("date"), 1))
-        .withColumn("is_current", F.lit(False))
-        .withColumn("change_reason", F.lit("RENAME"))
-    )
-    changed_new = (
-        changed.select("n.*")
-        .withColumn("change_reason", F.lit("RENAME"))
-        .withColumn("is_current", F.lit(True))
-        .withColumn("valid_to", F.lit(None).cast("date"))
-        .withColumn("valid_from", F.lit(ingestion_date).cast("date"))
-    )
-
-    # New vendor_gk not in existing
-    new_only = joined.filter(F.col("e.vendor_gk").isNull()).select("n.*")
-
-    # Existing current records NOT in new data - keep them as-is (still current)
-    not_in_new = existing_current.join(
-        new_dim.select("vendor_gk"), "vendor_gk", "left_anti"
-    )
-
-    return (
-        existing_hist.unionByName(unchanged)
-        .unionByName(closed)
-        .unionByName(changed_new)
-        .unionByName(new_only)
-        .unionByName(not_in_new)
-    )
-
-
-def build_xref(vendor_scored, group_to_gk, ingestion_date):
-    return vendor_scored.join(group_to_gk, on="match_group", how="left").select(
-        F.col("vendor_id"),
-        F.col("vendor_gk"),
-        F.lit(ingestion_date).cast("date").alias("valid_from"),
-        F.lit(None).cast("date").alias("valid_to"),
-        F.lit(True).alias("is_current"),
-        F.col("decision"),
-    )
-
-
-def apply_xref_scd2(new_xref, existing_xref, ingestion_date):
-    if existing_xref is None:
-        return new_xref
-
-    existing_current = existing_xref.filter(F.col("is_current") == F.lit(True))
-    existing_hist = existing_xref.filter(F.col("is_current") == F.lit(False))
-
-    joined = new_xref.alias("n").join(existing_current.alias("e"), "vendor_id", "left")
-
-    # Records that exist in both and haven't changed - keep existing
-    # Only compare vendor_gk and decision (not match_rule/match_confidence which are metadata)
-    unchanged = joined.filter(
-        F.col("e.vendor_id").isNotNull()
-        & (F.col("e.vendor_gk") == F.col("n.vendor_gk"))
-        & (F.col("e.decision") == F.col("n.decision"))
-    ).select("e.*")
-
-    # Records that exist in both but have changed
-    changed = joined.filter(
-        F.col("e.vendor_id").isNotNull()
-        & ~(
-            (F.col("e.vendor_gk") == F.col("n.vendor_gk"))
-            & (F.col("e.decision") == F.col("n.decision"))
-        )
-    )
-    # Close old records - valid_to is day before new record starts
-    closed = (
-        changed.select("e.*")
-        .withColumn("valid_to", F.date_sub(F.lit(ingestion_date).cast("date"), 1))
-        .withColumn("is_current", F.lit(False))
-    )
-    changed_new = changed.select("n.*")
-
-    # New vendor_ids not in existing
-    new_only = joined.filter(F.col("e.vendor_id").isNull()).select("n.*")
-
-    # Existing current records NOT in new data - keep them as-is (still current)
-    not_in_new = existing_current.join(
-        new_xref.select("vendor_id"), "vendor_id", "left_anti"
-    )
-
-    return (
-        existing_hist.unionByName(unchanged)
-        .unionByName(closed)
-        .unionByName(changed_new)
-        .unionByName(new_only)
-        .unionByName(not_in_new)
-    )
-
-
-def write_dim_vendor(df, spark, table, path):
+def build_master_records_sql(spark, vendor_scored, existing_masters):
     """
-    Create dim_vendor table if missing and overwrite the data.
+    Build master records using SQL: survivorship + name comparison with existing masters.
+    Returns DataFrame with vendor_gk, canonical_name, record_hash, match_group.
     """
-    spark.sql(
-        f"""
+    vendor_scored.createOrReplaceTempView("vendor_scored")
+
+    # Create empty view if no existing masters (avoids duplicate SQL)
+    if existing_masters is not None:
+        existing_masters.createOrReplaceTempView("existing_masters")
+    else:
+        spark.sql("""
+            CREATE OR REPLACE TEMP VIEW existing_masters AS
+            SELECT CAST(NULL AS LONG) AS vendor_gk, CAST(NULL AS STRING) AS canonical_name
+            WHERE 1=0
+        """)
+
+    return spark.sql("""
+        WITH survivorship_winner AS (
+            SELECT *, ROW_NUMBER() OVER (
+                PARTITION BY match_group
+                ORDER BY LENGTH(vendor_name) DESC, vendor_id ASC
+            ) AS rn
+            FROM vendor_scored
+        ),
+        group_winner AS (
+            SELECT match_group, COALESCE(vendor_name, normalized_name) AS new_canonical
+            FROM survivorship_winner WHERE rn = 1
+        ),
+        with_best_name AS (
+            SELECT
+                w.match_group,
+                COALESCE(e.vendor_gk, ABS(XXHASH64(CONCAT_WS('|', w.new_canonical, CAST(w.match_group AS STRING))))) AS vendor_gk,
+                CASE
+                    WHEN e.vendor_gk IS NOT NULL AND LENGTH(w.new_canonical) > LENGTH(e.canonical_name) THEN w.new_canonical
+                    WHEN e.vendor_gk IS NOT NULL THEN e.canonical_name
+                    ELSE w.new_canonical
+                END AS canonical_name
+            FROM group_winner w
+            LEFT JOIN existing_masters e ON w.match_group = e.vendor_gk
+        )
+        SELECT vendor_gk, canonical_name, SHA2(canonical_name, 256) AS record_hash, match_group
+        FROM with_best_name
+    """)
+
+
+def merge_scd2_dim_vendor(spark, new_dim, table, path, ingestion_date):
+    """Apply SCD Type 2 to dim_vendor using single MERGE statement."""
+    spark.sql(f"""
         CREATE TABLE IF NOT EXISTS {table} (
             vendor_gk LONG,
             canonical_name STRING,
@@ -672,30 +376,50 @@ def write_dim_vendor(df, spark, table, path):
         )
         USING DELTA
         LOCATION '{path}'
-        """
-    )
-    (
-        df.select(
-            "vendor_gk",
-            "canonical_name",
-            "valid_from",
-            "valid_to",
-            "is_current",
-            "change_reason",
-            "record_hash",
-        )
-        .write.format("delta")
-        .mode("overwrite")
-        .insertInto(table)
-    )
+    """)
+
+    new_dim.createOrReplaceTempView("new_dim")
+
+    spark.sql(f"""
+        MERGE INTO {table} AS t
+        USING (
+            SELECT n.vendor_gk, n.canonical_name, n.record_hash,
+                   DATE '{ingestion_date}' AS valid_from,
+                   CAST(NULL AS DATE) AS valid_to,
+                   true AS is_current,
+                   CASE WHEN e.vendor_gk IS NULL THEN 'NEW' ELSE 'RENAME' END AS change_reason,
+                   1 AS _action
+            FROM new_dim n
+            LEFT JOIN {table} e ON n.vendor_gk = e.vendor_gk AND e.is_current
+            WHERE e.vendor_gk IS NULL OR e.record_hash != n.record_hash
+
+            UNION ALL
+
+            SELECT e.vendor_gk, e.canonical_name, e.record_hash,
+                   e.valid_from,
+                   DATE_SUB(DATE '{ingestion_date}', 1) AS valid_to,
+                   false AS is_current,
+                   e.change_reason,
+                   0 AS _action
+            FROM new_dim n
+            JOIN {table} e ON n.vendor_gk = e.vendor_gk AND e.is_current
+            WHERE e.record_hash != n.record_hash
+        ) AS s
+        ON t.vendor_gk = s.vendor_gk AND t.is_current AND s._action = 0
+        WHEN MATCHED THEN
+            UPDATE SET valid_to = s.valid_to, is_current = false
+        WHEN NOT MATCHED THEN
+            INSERT (vendor_gk, canonical_name, valid_from, valid_to, is_current, change_reason, record_hash)
+            VALUES (s.vendor_gk, s.canonical_name, s.valid_from, s.valid_to, s.is_current, s.change_reason, s.record_hash)
+    """)
 
 
-def write_xref_vendor(df, spark, table, path):
+def merge_scd2_xref_vendor(spark, table, path, ingestion_date):
+    """Apply SCD Type 2 to xref_vendor using single MERGE statement.
+
+    Expects temp views: vendor_scored, master_records
     """
-    Create xref_vendor table if missing and overwrite the data.
-    """
-    spark.sql(
-        f"""
+    spark.sql(f"""
         CREATE TABLE IF NOT EXISTS {table} (
             vendor_id INT,
             vendor_gk LONG,
@@ -706,21 +430,46 @@ def write_xref_vendor(df, spark, table, path):
         )
         USING DELTA
         LOCATION '{path}'
-        """
-    )
-    (
-        df.select(
-            "vendor_id",
-            "vendor_gk",
-            "valid_from",
-            "valid_to",
-            "is_current",
-            "decision",
-        )
-        .write.format("delta")
-        .mode("overwrite")
-        .insertInto(table)
-    )
+    """)
+
+    # Build xref by joining vendor_scored with master_records
+    spark.sql("""
+        CREATE OR REPLACE TEMP VIEW new_xref AS
+        SELECT v.vendor_id, m.vendor_gk, v.decision
+        FROM vendor_scored v
+        LEFT JOIN master_records m ON v.match_group = m.match_group
+    """)
+
+    spark.sql(f"""
+        MERGE INTO {table} AS t
+        USING (
+            SELECT n.vendor_id, n.vendor_gk, n.decision,
+                   DATE '{ingestion_date}' AS valid_from,
+                   CAST(NULL AS DATE) AS valid_to,
+                   true AS is_current,
+                   1 AS _action
+            FROM new_xref n
+            LEFT JOIN {table} e ON n.vendor_id = e.vendor_id AND e.is_current
+            WHERE e.vendor_id IS NULL OR e.vendor_gk != n.vendor_gk OR e.decision != n.decision
+
+            UNION ALL
+
+            SELECT e.vendor_id, e.vendor_gk, e.decision,
+                   e.valid_from,
+                   DATE_SUB(DATE '{ingestion_date}', 1) AS valid_to,
+                   false AS is_current,
+                   0 AS _action
+            FROM new_xref n
+            JOIN {table} e ON n.vendor_id = e.vendor_id AND e.is_current
+            WHERE e.vendor_gk != n.vendor_gk OR e.decision != n.decision
+        ) AS s
+        ON t.vendor_id = s.vendor_id AND t.is_current AND s._action = 0
+        WHEN MATCHED THEN
+            UPDATE SET valid_to = s.valid_to, is_current = false
+        WHEN NOT MATCHED THEN
+            INSERT (vendor_id, vendor_gk, valid_from, valid_to, is_current, decision)
+            VALUES (s.vendor_id, s.vendor_gk, s.valid_from, s.valid_to, s.is_current, s.decision)
+    """)
 
 
 def main():
@@ -745,33 +494,33 @@ def main():
         job.commit()
         return
 
-    vendor_df = generate_record_hash(vendor_df)
-
+    # Load existing masters for matching
     existing_dim = (
         spark.read.table(master_dim_table)
         if spark.catalog.tableExists(master_dim_table)
         else None
     )
-    existing_current = None
+    existing_masters = None
     if existing_dim is not None:
-        existing_current = (
-            existing_dim.filter(F.col("is_current") == F.lit(True))
+        existing_masters = (
+            existing_dim.filter(F.col("is_current"))
             .withColumn(
                 "normalized_name", normalized_vendor_name(F.col("canonical_name"))
             )
             .select("vendor_gk", "canonical_name", "normalized_name")
         )
 
+    # Match vendors to existing masters
     metrics_df, debug_pairs_df = build_recordlinkage_metrics(
-        vendor_df, existing_current, ingestion_date
+        vendor_df, existing_masters, ingestion_date
     )
     metrics_sdf = spark.createDataFrame(metrics_df).select(
         F.col("vendor_id").cast("int"),
         F.col("match_group").cast("long"),
         F.col("match_confidence").cast("double"),
-        F.col("match_rule").cast("string"),
     )
 
+    # Score vendors and determine decision
     vendor_scored = vendor_df.join(metrics_sdf, on="vendor_id", how="left")
     vendor_scored = vendor_scored.withColumn(
         "decision",
@@ -781,22 +530,14 @@ def main():
         .otherwise(F.lit("NO_MATCH")),
     )
 
-    master_candidates = apply_survivorship_rules(vendor_scored)
-    master_records = build_master_records(master_candidates, existing_current)
+    master_records = build_master_records_sql(spark, vendor_scored, existing_masters)
+    master_records.createOrReplaceTempView("master_records")
 
-    final_dim_vendor = apply_scd_type_2(master_records, existing_dim, ingestion_date)
+    # SCD2 merge for dim_vendor
+    merge_scd2_dim_vendor(spark, master_records, master_dim_table, dim_vendor_path, ingestion_date)
 
-    group_to_gk = master_records.select("match_group", "vendor_gk")
-    new_xref = build_xref(vendor_scored, group_to_gk, ingestion_date)
-    existing_xref = (
-        spark.read.table(master_xref_table)
-        if spark.catalog.tableExists(master_xref_table)
-        else None
-    )
-    final_xref_vendor = apply_xref_scd2(new_xref, existing_xref, ingestion_date)
-
-    write_dim_vendor(final_dim_vendor, spark, master_dim_table, dim_vendor_path)
-    write_xref_vendor(final_xref_vendor, spark, master_xref_table, xref_vendor_path)
+    # SCD2 merge for xref_vendor (uses vendor_scored and master_records temp views)
+    merge_scd2_xref_vendor(spark, master_xref_table, xref_vendor_path, ingestion_date)
 
     if not debug_pairs_df.empty:
         debug_pairs_sdf = spark.createDataFrame(debug_pairs_df)
